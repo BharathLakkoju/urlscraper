@@ -2,6 +2,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -483,16 +484,27 @@ export default function Home() {
     const saved = localStorage.getItem("scraper_theme") as ThemeId | null;
     if (saved && THEMES[saved]) setThemeId(saved);
     setRateInfo(getRateLimitInfo());
+    // Fade out and remove the loading splash
+    const splash = document.getElementById("__splash");
+    if (splash) {
+      splash.style.opacity = "0";
+      setTimeout(() => splash.remove(), 280);
+    }
   }, []);
 
   const theme = THEMES[themeId];
 
-  // Sync body background and color-scheme with theme
+  // Sync theme vars, body background, and color-scheme with active theme
   useEffect(() => {
+    const root = document.documentElement;
+    Object.entries(theme.vars).forEach(([key, val]) => {
+      root.style.setProperty(key, val);
+    });
     document.body.style.background = theme.vars["--bg"];
     document.body.style.color = theme.vars["--text"];
-    document.documentElement.style.colorScheme = theme.dark ? "dark" : "light";
-  }, [theme]);
+    root.style.colorScheme = theme.dark ? "dark" : "light";
+    root.setAttribute("data-theme", themeId);
+  }, [theme, themeId]);
 
   const changeTheme = (id: ThemeId) => {
     setThemeId(id);
@@ -513,6 +525,23 @@ export default function Home() {
     let finalUrl = trimmed;
     if (!finalUrl.startsWith("http://") && !finalUrl.startsWith("https://")) {
       finalUrl = "https://" + finalUrl;
+    }
+
+    // Client-side validation
+    if (finalUrl.length > 2048) {
+      setError("URL is too long (max 2048 characters).");
+      setStatus("error");
+      return;
+    }
+    try {
+      const parsed = new URL(finalUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error();
+      }
+    } catch {
+      setError("Invalid URL. Please enter a valid http or https address.");
+      setStatus("error");
+      return;
     }
 
     setStatus("loading");
@@ -567,11 +596,7 @@ export default function Home() {
   const showRateBar = rateInfo.remaining < RATE_LIMIT;
 
   return (
-    <div
-      className="page"
-      style={theme.vars as React.CSSProperties}
-      data-theme={themeId}
-    >
+    <div className="page" data-theme={themeId}>
       <div className="noise" />
 
       <header className="header">
@@ -684,7 +709,10 @@ export default function Home() {
             <div className="output-area">
               {viewMode === "markdown" ? (
                 <div className="md-body">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeSanitize]}
+                  >
                     {displayText}
                   </ReactMarkdown>
                 </div>
