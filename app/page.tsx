@@ -534,6 +534,139 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
 
 // ─── Plain text converter ─────────────────────────────────────────────────────
 
+// ─── Error classifier ────────────────────────────────────────────────────────
+
+type ErrorContext = {
+  headline: string;
+  reasons: string[];
+};
+
+function classifyError(msg: string): ErrorContext {
+  const m = msg.toLowerCase();
+
+  if (m.includes("rate limit")) {
+    return {
+      headline: "Request limit reached",
+      reasons: [
+        "You've used all 10 requests for this minute",
+        "Wait for the timer to reset, then try again",
+      ],
+    };
+  }
+  if (m.includes("too long") || m.includes("exceeds maximum")) {
+    return {
+      headline: "URL is too long",
+      reasons: [
+        "The URL exceeds the 2048-character limit",
+        "Try shortening or cleaning up any tracking parameters",
+      ],
+    };
+  }
+  if (m.includes("invalid url") || m.includes("invalid url format")) {
+    return {
+      headline: "Couldn't recognise that URL",
+      reasons: [
+        "Make sure the URL starts with http:// or https://",
+        "Check for typos or missing parts in the address",
+      ],
+    };
+  }
+  if (m.includes("not allowed") || m.includes("access to this host")) {
+    return {
+      headline: "This address can't be reached",
+      reasons: [
+        "Internal, local, or private network addresses are blocked",
+        "Only publicly accessible URLs are supported",
+      ],
+    };
+  }
+  if (
+    m.includes("403") ||
+    m.includes("401") ||
+    m.includes("forbidden") ||
+    m.includes("unauthorized")
+  ) {
+    return {
+      headline: "Access was denied by the site",
+      reasons: [
+        "The page requires a login or subscription",
+        "The site may be blocking automated requests",
+        "Try a publicly accessible version of the page",
+      ],
+    };
+  }
+  if (m.includes("404") || m.includes("not found")) {
+    return {
+      headline: "Page not found",
+      reasons: [
+        "The URL may have moved or been deleted",
+        "Double-check the link is still live in your browser",
+      ],
+    };
+  }
+  if (m.includes("429") || m.includes("too many requests")) {
+    return {
+      headline: "The site is rate-limiting us",
+      reasons: [
+        "The target site is rejecting repeated requests",
+        "Wait a minute and try again",
+      ],
+    };
+  }
+  if (m.includes("timeout") || m.includes("timed out") || m.includes("408")) {
+    return {
+      headline: "The request timed out",
+      reasons: [
+        "The site took too long to respond (limit: 15 s)",
+        "It may be down, slow, or blocking scrapers",
+        "Try again in a moment",
+      ],
+    };
+  }
+  if (m.includes("unsupported content type") || m.includes("only html")) {
+    return {
+      headline: "That link isn't an HTML page",
+      reasons: [
+        "Only web pages (HTML) can be scraped — not PDFs, images, or files",
+        "Try linking directly to the article or page rather than a file download",
+      ],
+    };
+  }
+  if (m.includes("too large") || m.includes("5 mb")) {
+    return {
+      headline: "Page is too large to process",
+      reasons: [
+        "The page exceeds the 5 MB size limit",
+        "Try a smaller or more specific page on the same site",
+      ],
+    };
+  }
+  if (
+    m.includes("5") ||
+    m.includes("500") ||
+    m.includes("502") ||
+    m.includes("503")
+  ) {
+    return {
+      headline: "The site returned a server error",
+      reasons: [
+        "The website itself is experiencing issues",
+        "Try again in a few minutes",
+      ],
+    };
+  }
+  // Fallback
+  return {
+    headline: "Couldn't scrape this page",
+    reasons: [
+      "The site may be blocking automated access",
+      "It could require a login or be behind a paywall",
+      "The page might be a web app that loads content via JavaScript",
+      "Check that the URL opens correctly in your browser",
+    ],
+  };
+}
+
 function toPlainText(md: string): string {
   return md
     .replace(/^#{1,6}\s+/gm, "")
@@ -907,12 +1040,23 @@ export default function Home() {
           )}
         </div>
 
-        {status === "error" && (
-          <div className="error-card">
-            <span className="error-icon">✕</span>
-            <span>{error}</span>
-          </div>
-        )}
+        {status === "error" &&
+          (() => {
+            const ctx = classifyError(error);
+            return (
+              <div className="error-card">
+                <span className="error-icon">✕</span>
+                <div className="error-body">
+                  <span className="error-headline">{ctx.headline}</span>
+                  <ul className="error-reasons">
+                    {ctx.reasons.map((r, i) => (
+                      <li key={i}>{r}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            );
+          })()}
 
         {status === "success" && result && (
           <div className="result-section">
@@ -1254,7 +1398,20 @@ const styles = `
     border-radius: 4px; padding: 16px 20px;
     font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--error);
   }
-  .error-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+  .error-icon { font-size: 14px; flex-shrink: 0; margin-top: 2px; }
+  .error-body { display: flex; flex-direction: column; gap: 6px; }
+  .error-headline { font-weight: 500; }
+  .error-reasons {
+    list-style: none; padding: 0; margin: 0;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .error-reasons li {
+    color: var(--error); opacity: 0.75;
+    padding-left: 12px; position: relative;
+  }
+  .error-reasons li::before {
+    content: '–'; position: absolute; left: 0; opacity: 0.6;
+  }
 
   /* ── Result ── */
   .result-section { animation: fade-up 0.3s ease; }
