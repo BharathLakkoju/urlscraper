@@ -708,6 +708,13 @@ export default function Home() {
     localStorage.setItem("scraper_theme", id);
   };
 
+  // Live rate-limit ticker — refreshes every second while any requests are in use
+  useEffect(() => {
+    if (rateInfo.remaining >= RATE_LIMIT) return;
+    const id = setInterval(() => setRateInfo(getRateLimitInfo()), 1000);
+    return () => clearInterval(id);
+  }, [rateInfo.remaining]);
+
   const scrape = useCallback(async () => {
     const trimmed = url.trim();
     if (!trimmed) return;
@@ -865,11 +872,34 @@ export default function Home() {
           )}
           {showRateBar && (
             <div className="rate-info">
-              <span className="rate-dot" />
-              {rateInfo.remaining} / {RATE_LIMIT} requests remaining this minute
-              {rateInfo.remaining === 0 && rateInfo.resetIn > 0 && (
-                <span className="rate-reset">
-                  {" "}
+              <span
+                className={`rate-dot${
+                  rateInfo.remaining === 0 ? " rate-dot-warn" : ""
+                }`}
+              />
+              <span className="rate-fraction">
+                {RATE_LIMIT - rateInfo.remaining}&nbsp;/&nbsp;{RATE_LIMIT} used
+              </span>
+              <span className="rate-pips" aria-hidden="true">
+                {Array.from({ length: RATE_LIMIT }).map((_, i) => (
+                  <span
+                    key={i}
+                    className={`rate-pip${
+                      i < RATE_LIMIT - rateInfo.remaining
+                        ? rateInfo.remaining === 0
+                          ? " rate-pip-used rate-pip-warn"
+                          : " rate-pip-used"
+                        : ""
+                    }`}
+                  />
+                ))}
+              </span>
+              {rateInfo.resetIn > 0 && (
+                <span
+                  className={`rate-timer${
+                    rateInfo.remaining === 0 ? " rate-timer-warn" : ""
+                  }`}
+                >
                   · resets in {rateInfo.resetIn}s
                 </span>
               )}
@@ -947,16 +977,26 @@ export default function Home() {
                 <button
                   className="action-btn"
                   onClick={copyToClipboard}
-                  aria-label="Copy to clipboard"
+                  aria-label={`Copy as ${viewMode === "json" ? "JSON" : viewMode === "plaintext" ? "plain text" : "Markdown"}`}
                 >
-                  {copied ? "✓ copied" : "copy"}
+                  {copied
+                    ? "✓ copied"
+                    : viewMode === "json"
+                      ? "copy .json"
+                      : viewMode === "plaintext"
+                        ? "copy .txt"
+                        : "copy .md"}
                 </button>
                 <button
                   className="action-btn"
                   onClick={downloadFile}
-                  aria-label="Download file"
+                  aria-label={`Download as ${viewMode === "json" ? "JSON" : viewMode === "plaintext" ? "plain text" : "Markdown"}`}
                 >
-                  download
+                  {viewMode === "json"
+                    ? "download .json"
+                    : viewMode === "plaintext"
+                      ? "download .txt"
+                      : "download .md"}
                 </button>
               </div>
             </div>
@@ -1183,15 +1223,29 @@ const styles = `
 
   /* ── Rate Info ── */
   .rate-info {
-    display: flex; align-items: center; gap: 6px;
+    display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
     margin-top: 8px; font-family: 'IBM Plex Mono', monospace;
     font-size: 11px; color: var(--text-muted);
   }
   .rate-dot {
     width: 6px; height: 6px; border-radius: 50%;
     background: var(--accent); flex-shrink: 0;
+    transition: background 0.3s;
   }
-  .rate-reset { color: var(--error); }
+  .rate-dot.rate-dot-warn { background: var(--error); }
+  .rate-fraction { letter-spacing: 0.02em; }
+  .rate-pips {
+    display: flex; align-items: center; gap: 3px;
+  }
+  .rate-pip {
+    width: 8px; height: 8px; border-radius: 2px;
+    background: var(--border-bright); flex-shrink: 0;
+    transition: background 0.2s;
+  }
+  .rate-pip.rate-pip-used { background: var(--accent); }
+  .rate-pip.rate-pip-warn { background: var(--error); }
+  .rate-timer { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .rate-timer.rate-timer-warn { color: var(--error); font-weight: 500; }
 
   /* ── Error ── */
   .error-card {
