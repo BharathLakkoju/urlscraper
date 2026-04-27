@@ -4,11 +4,21 @@ import TurndownService from "turndown";
 
 // ─── Server-side rate limiting (in-memory, per IP) ───────────────────────────
 const ipRequests = new Map<string, number[]>();
-const SERVER_RATE_LIMIT = 20;        // requests per IP
-const SERVER_RATE_WINDOW_MS = 60_000; // 1 minute
+const SERVER_RATE_LIMIT = 20;
+const SERVER_RATE_WINDOW_MS = 60_000;
+let lastCleanup = Date.now();
 
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
+  // Periodic cleanup — prevents unbounded map growth in long-running processes
+  if (now - lastCleanup > SERVER_RATE_WINDOW_MS * 5) {
+    for (const [key, times] of ipRequests) {
+      const fresh = times.filter((t) => now - t < SERVER_RATE_WINDOW_MS);
+      if (fresh.length === 0) ipRequests.delete(key);
+      else ipRequests.set(key, fresh);
+    }
+    lastCleanup = now;
+  }
   const prev = (ipRequests.get(ip) ?? []).filter((t) => now - t < SERVER_RATE_WINDOW_MS);
   if (prev.length >= SERVER_RATE_LIMIT) return false;
   ipRequests.set(ip, [...prev, now]);
@@ -57,6 +67,95 @@ function validateUrl(raw: string): { ok: true; url: URL } | { ok: false; error: 
   return { ok: true, url: parsed };
 }
 
+// ─── Structured data helpers ──────────────────────────────────────────────────
+
+/** Strip all markdown syntax and collapse whitespace into a single clean string. */
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*([\s\S]+?)\*\*/g, "$1")
+    .replace(/\*([\s\S]+?)\*/g, "$1")
+    .replace(/`{3}[\s\S]*?`{3}/g, "")
+    .replace(/`(.+?)`/g, "$1")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/\[(.+?)\]\(.+?\)/g, "$1")
+    .replace(/^>\s*/gm, "")
+    .replace(/^---+$/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+type Section = {
+  heading: string;
+  level: number;
+  word_count: number;
+  body: string;
+};
+
+function buildSections(md: string): Section[] {
+  const sections: Section[] = [];
+  const headingRe = /^(#{1,6})\s+(.+)$/;
+  let heading = "";
+  let level = 0;
+  const buf: string[] = [];
+
+  const flush = () => {
+    const body = stripMarkdown(buf.join(" "));
+    if (body) {
+      sections.push({
+        heading,
+        level,
+        word_count: body.split(/\s+/).filter(Boolean).length,
+        body,
+      });
+    }
+    buf.length = 0;
+  };
+
+  for (const line of md.split("\n")) {
+    const m = line.match(headingRe);
+    if (m) {
+      flush();
+      level = m[1].length;
+      heading = m[2].trim();
+    } else if (line.trim()) {
+      buf.push(line.trim());
+    }
+  }
+  flush();
+  return sections;
+}
+
+/** Extract fenced code blocks — useful for AI context on technical pages. */
+function extractCodeBlocks(md: string): Array<{ language: string; code: string }> {
+  const blocks: Array<{ language: string; code: string }> = [];
+  const re = /^```(\w*)\n([\s\S]*?)^```/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(md)) !== null) {
+    const code = m[2].trim();
+    if (code.length > 0 && code.length < 4_000) {
+      blocks.push({ language: m[1] || "text", code });
+    }
+  }
+  return blocks.slice(0, 10);
+}
+
+/** Heuristically classify the page content type — helps AI tailor responses. */
+function detectContentType(sampleHtml: string, title: string): string {
+  const lower = (title + " " + sampleHtml).toLowerCase();
+  if (/documentation|api reference|reference guide|developer guide/.test(lower))
+    return "documentation";
+  if (/\btutorial\b|how[-\s]to|step[- ]by[- ]step|\bguide\b/.test(lower))
+    return "tutorial";
+  if (/\bnews\b|breaking|journalist|reporter/.test(lower)) return "news";
+  if (/research|abstract|methodology|conclusion|doi\.org/.test(lower)) return "research";
+  if (/wikipedia|encyclop/.test(lower)) return "encyclopedia";
+  if (/product|pricing|buy now|add to cart|shop/.test(lower)) return "product";
+  if (/\bblog\b|personal site|opinion|essay/.test(lower)) return "blog";
+  return "article";
+}
+
 // ─── Markdown output sanitization ────────────────────────────────────────────
 function sanitizeMarkdown(md: string): string {
   return md
@@ -70,8 +169,15 @@ function sanitizeMarkdown(md: string): string {
 }
 
 export async function POST(req: NextRequest) {
+  // Security headers applied to every response from this route
+  const securityHeaders = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+  };
+
   try {
-    // ── Server-side rate limiting ─────────────────────────────────────────────
+    // ── Rate limiting ─────────────────────────────────────────────────────────
     const forwarded = req.headers.get("x-forwarded-for");
     const ip = forwarded
       ? forwarded.split(",")[0].trim()
@@ -79,32 +185,46 @@ export async function POST(req: NextRequest) {
     if (!checkRateLimit(ip)) {
       return NextResponse.json(
         { error: "Too many requests. Please wait before trying again." },
-        { status: 429 }
+        { status: 429, headers: securityHeaders }
       );
     }
 
-    // ── Parse and validate request body ──────────────────────────────────────
+    // ── Parse & validate body ─────────────────────────────────────────────────
     let body: unknown;
     try {
       body = await req.json();
     } catch {
-      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Invalid request body" },
+        { status: 400, headers: securityHeaders }
+      );
     }
     if (!body || typeof body !== "object" || !("url" in body)) {
-      return NextResponse.json({ error: "Missing url field" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing url field" },
+        { status: 400, headers: securityHeaders }
+      );
     }
     const rawUrl = (body as Record<string, unknown>).url;
     if (typeof rawUrl !== "string") {
-      return NextResponse.json({ error: "url must be a string" }, { status: 400 });
+      return NextResponse.json(
+        { error: "url must be a string" },
+        { status: 400, headers: securityHeaders }
+      );
     }
 
     // ── URL validation (SSRF + protocol check) ────────────────────────────────
     const validation = validateUrl(rawUrl);
     if (!validation.ok) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
+      return NextResponse.json(
+        { error: validation.error },
+        { status: 400, headers: securityHeaders }
+      );
     }
     const safeUrl = validation.url.toString();
+    const hostname = validation.url.hostname;
 
+    // ── Fetch page ────────────────────────────────────────────────────────────
     const response = await fetch(safeUrl, {
       headers: {
         "User-Agent":
@@ -112,14 +232,14 @@ export async function POST(req: NextRequest) {
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
       },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(15_000),
       redirect: "follow",
     });
 
     if (!response.ok) {
       return NextResponse.json(
         { error: `Failed to fetch URL: ${response.status} ${response.statusText}` },
-        { status: 400 }
+        { status: 400, headers: securityHeaders }
       );
     }
 
@@ -127,7 +247,7 @@ export async function POST(req: NextRequest) {
     if (!contentType.includes("text/html")) {
       return NextResponse.json(
         { error: `Unsupported content type: ${contentType}. Only HTML pages are supported.` },
-        { status: 400 }
+        { status: 400, headers: securityHeaders }
       );
     }
 
@@ -136,7 +256,7 @@ export async function POST(req: NextRequest) {
     if (clHeader && Number(clHeader) > MAX_RESPONSE_BYTES) {
       return NextResponse.json(
         { error: "Page is too large to process (limit: 5 MB)." },
-        { status: 400 }
+        { status: 400, headers: securityHeaders }
       );
     }
 
@@ -144,12 +264,13 @@ export async function POST(req: NextRequest) {
     if (html.length > MAX_RESPONSE_BYTES) {
       return NextResponse.json(
         { error: "Page is too large to process (limit: 5 MB)." },
-        { status: 400 }
+        { status: 400, headers: securityHeaders }
       );
     }
+
     const root = parse(html);
 
-    // Remove noise elements
+    // ── Strip noise elements ──────────────────────────────────────────────────
     const noiseSelectors = [
       "script", "style", "noscript", "iframe", "svg", "canvas",
       "nav", "footer", "header", "aside",
@@ -162,35 +283,74 @@ export async function POST(req: NextRequest) {
       root.querySelectorAll(sel).forEach((el) => el.remove());
     });
 
-    // Extract title
-    const titleEl = root.querySelector("title");
-    const title = titleEl?.text?.trim() ?? "";
+    // ── Extract metadata ──────────────────────────────────────────────────────
+    // Prefer OpenGraph titles for accuracy, fall back to <title>
+    const title =
+      root.querySelector("meta[property='og:title']")?.getAttribute("content")?.trim() ||
+      root.querySelector("title")?.text?.trim() ||
+      "";
 
-    // Extract meta description
-    const metaDesc = root.querySelector("meta[name='description']")?.getAttribute("content")?.trim() ?? "";
+    const description =
+      root.querySelector("meta[property='og:description']")?.getAttribute("content")?.trim() ||
+      root.querySelector("meta[name='description']")?.getAttribute("content")?.trim() ||
+      "";
 
-    // Try to grab main content area
-    const contentSelectors = ["article", "main", "[role='main']", ".content", "#content", ".post", ".entry", "body"];
+    const siteName =
+      root.querySelector("meta[property='og:site_name']")?.getAttribute("content")?.trim() ||
+      "";
+
+    const canonicalUrl =
+      root.querySelector("link[rel='canonical']")?.getAttribute("href")?.trim() ||
+      safeUrl;
+
+    const author =
+      root.querySelector("meta[name='author']")?.getAttribute("content")?.trim() ||
+      root.querySelector("meta[property='article:author']")?.getAttribute("content")?.trim() ||
+      root.querySelector("[itemprop='author'] [itemprop='name']")?.text?.trim() ||
+      "";
+
+    const published =
+      root.querySelector("meta[property='article:published_time']")?.getAttribute("content")?.trim() ||
+      root.querySelector("meta[name='date']")?.getAttribute("content")?.trim() ||
+      root.querySelector("time[datetime]")?.getAttribute("datetime")?.trim() ||
+      "";
+
+    const modified =
+      root.querySelector("meta[property='article:modified_time']")?.getAttribute("content")?.trim() ||
+      root.querySelector("meta[name='last-modified']")?.getAttribute("content")?.trim() ||
+      "";
+
+    const lang =
+      root.querySelector("html")?.getAttribute("lang")?.split("-")[0].toLowerCase() ||
+      "en";
+
+    const keywordsRaw =
+      root.querySelector("meta[name='keywords']")?.getAttribute("content")?.trim() ||
+      "";
+    const keywords = keywordsRaw
+      ? keywordsRaw.split(",").map((k) => k.trim()).filter(Boolean).slice(0, 20)
+      : [];
+
+    // ── Locate main content area ──────────────────────────────────────────────
+    const contentSelectors = [
+      "article", "main", "[role='main']",
+      ".content", "#content", ".post", ".entry", "body",
+    ];
     let contentHtml = "";
     for (const sel of contentSelectors) {
       const el = root.querySelector(sel);
-      if (el) {
-        contentHtml = el.innerHTML;
-        break;
-      }
+      if (el) { contentHtml = el.innerHTML; break; }
     }
-
     if (!contentHtml) contentHtml = root.innerHTML;
 
-    // Convert HTML → Markdown
+    // ── Convert HTML → Markdown ───────────────────────────────────────────────
     const td = new TurndownService({
       headingStyle: "atx",
       codeBlockStyle: "fenced",
       bulletListMarker: "-",
     });
 
-    // Remove remaining tags that aren't useful
-    td.addRule("removeImages", {
+    td.addRule("removeMedia", {
       filter: ["img", "picture", "figure", "video", "audio", "source", "track"],
       replacement: () => "",
     });
@@ -209,35 +369,93 @@ export async function POST(req: NextRequest) {
       replacement: (content) => (content.trim() ? content.trim() : ""),
     });
 
-    let markdown = td.turndown(contentHtml);
-
-    // Clean up excessive blank lines and whitespace
-    markdown = markdown
+    let markdown = td.turndown(contentHtml)
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]+$/gm, "")
       .trim();
 
-    // Build final output
+    // Build final markdown with title / description header
     const parts: string[] = [];
     if (title) parts.push(`# ${title}`);
-    if (metaDesc) parts.push(`> ${metaDesc}`);
+    if (description) parts.push(`> ${description}`);
     if (parts.length) parts.push("---");
     parts.push(markdown);
 
     const finalMarkdown = sanitizeMarkdown(parts.join("\n\n"));
 
-    return NextResponse.json({
-      markdown: finalMarkdown,
+    // ── Build AI-optimised structured document ────────────────────────────────
+    const sections = buildSections(finalMarkdown);
+    const codeBlocks = extractCodeBlocks(finalMarkdown);
+    const wordCount = finalMarkdown.split(/\s+/).filter(Boolean).length;
+    const readingTimeMinutes = Math.max(1, Math.round(wordCount / 200));
+    const content = stripMarkdown(finalMarkdown);
+    // Summary: first ~600 characters of cleaned content — quick AI context
+    const summary = content.length > 600
+      ? content.slice(0, 600).replace(/\s+\S+$/, "").trim() + "…"
+      : content;
+    const headings = sections
+      .filter((s) => s.heading)
+      .map((s) => ({ level: s.level, text: s.heading }));
+
+    // Build meta object — only include fields that have values (cleaner JSON)
+    const meta: Record<string, unknown> = {
       title,
-      wordCount: finalMarkdown.split(/\s+/).filter(Boolean).length,
-      charCount: finalMarkdown.length,
-      url: safeUrl,
-    });
+      description,
+      language: lang,
+      content_type: detectContentType(html.slice(0, 3_000), title),
+    };
+    if (siteName) meta.site_name = siteName;
+    if (author) meta.author = author;
+    if (published) meta.published = published;
+    if (modified) meta.modified = modified;
+    if (keywords.length) meta.keywords = keywords;
+
+    // Build source block
+    const source: Record<string, unknown> = { url: canonicalUrl, domain: hostname };
+    if (safeUrl !== canonicalUrl) source.original_url = safeUrl;
+
+    const structured = {
+      schema_version: "1.1",
+      scraped_at: new Date().toISOString(),
+      source,
+      meta,
+      stats: {
+        word_count: wordCount,
+        reading_time_minutes: readingTimeMinutes,
+        section_count: sections.length,
+        // Rough token estimate (GPT-4 avg ≈ 4 chars/token) for context planning
+        token_estimate: Math.ceil(content.length / 4),
+      },
+      summary,
+      headings,
+      sections,
+      ...(codeBlocks.length ? { code_blocks: codeBlocks } : {}),
+      content,
+    };
+
+    return NextResponse.json(
+      {
+        markdown: finalMarkdown,
+        title,
+        wordCount,
+        charCount: finalMarkdown.length,
+        readingTimeMinutes,
+        url: safeUrl,
+        structured,
+      },
+      { headers: securityHeaders }
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     if (message.includes("timeout") || message.includes("abort")) {
-      return NextResponse.json({ error: "Request timed out. The page took too long to respond." }, { status: 408 });
+      return NextResponse.json(
+        { error: "Request timed out. The page took too long to respond." },
+        { status: 408, headers: { "X-Content-Type-Options": "nosniff" } }
+      );
     }
-    return NextResponse.json({ error: `Scraping failed: ${message}` }, { status: 500 });
+    return NextResponse.json(
+      { error: `Scraping failed: ${message}` },
+      { status: 500, headers: { "X-Content-Type-Options": "nosniff" } }
+    );
   }
 }

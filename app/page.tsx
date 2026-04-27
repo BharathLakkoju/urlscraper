@@ -6,15 +6,57 @@ import rehypeSanitize from "rehype-sanitize";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+type Section = {
+  heading: string;
+  level: number;
+  word_count: number;
+  body: string;
+};
+
+type StructuredData = {
+  schema_version: string;
+  scraped_at: string;
+  source: {
+    url: string;
+    domain: string;
+    original_url?: string;
+  };
+  meta: {
+    title: string;
+    description: string;
+    language: string;
+    content_type: string;
+    site_name?: string;
+    author?: string;
+    published?: string;
+    modified?: string;
+    keywords?: string[];
+  };
+  stats: {
+    word_count: number;
+    reading_time_minutes: number;
+    section_count: number;
+    token_estimate: number;
+  };
+  summary: string;
+  headings: { level: number; text: string }[];
+  sections: Section[];
+  code_blocks?: { language: string; code: string }[];
+  content: string;
+};
+
 type ScrapeResult = {
   markdown: string;
   title: string;
   wordCount: number;
   charCount: number;
+  readingTimeMinutes: number;
   url: string;
+  structured: StructuredData;
 };
 
 type Status = "idle" | "loading" | "success" | "error";
+type ViewMode = "markdown" | "plaintext" | "json";
 type ThemeId =
   | "terminal"
   | "midnight"
@@ -26,7 +68,12 @@ type ThemeId =
   | "forest"
   | "paper"
   | "warm"
-  | "solarized";
+  | "solarized"
+  | "github"
+  | "mint"
+  | "ivory"
+  | "petal"
+  | "sky";
 
 // ─── Themes ──────────────────────────────────────────────────────────────────
 
@@ -295,6 +342,121 @@ const THEMES: Record<ThemeId, Theme> = {
       "--noise-opacity": "0.18",
     },
   },
+  github: {
+    id: "github",
+    name: "GitHub",
+    dark: false,
+    swatches: ["#ffffff", "#0969da", "#1f2328"],
+    vars: {
+      "--bg": "#ffffff",
+      "--surface": "#f6f8fa",
+      "--border": "#d0d7de",
+      "--border-bright": "#b0bac4",
+      "--accent": "#0969da",
+      "--accent-dim": "rgba(9,105,218,0.08)",
+      "--accent-fg": "#ffffff",
+      "--text": "#1f2328",
+      "--text-muted": "#57606a",
+      "--text-dim": "#b0bac4",
+      "--error": "#cf222e",
+      "--error-bg": "rgba(207,34,46,0.06)",
+      "--code-bg": "#f6f8fa",
+      "--blockquote-border": "#0969da",
+      "--noise-opacity": "0.06",
+    },
+  },
+  mint: {
+    id: "mint",
+    name: "Mint",
+    dark: false,
+    swatches: ["#f0faf5", "#059669", "#0f2d1e"],
+    vars: {
+      "--bg": "#f0faf5",
+      "--surface": "#e4f5ec",
+      "--border": "#c6e8d4",
+      "--border-bright": "#a0d4b8",
+      "--accent": "#059669",
+      "--accent-dim": "rgba(5,150,105,0.1)",
+      "--accent-fg": "#ffffff",
+      "--text": "#0f2d1e",
+      "--text-muted": "#3a6e52",
+      "--text-dim": "#a0d4b8",
+      "--error": "#dc2626",
+      "--error-bg": "rgba(220,38,38,0.06)",
+      "--code-bg": "#d8f0e4",
+      "--blockquote-border": "#059669",
+      "--noise-opacity": "0.14",
+    },
+  },
+  ivory: {
+    id: "ivory",
+    name: "Ivory",
+    dark: false,
+    swatches: ["#fffff0", "#92400e", "#1c1007"],
+    vars: {
+      "--bg": "#fffff0",
+      "--surface": "#faf9e4",
+      "--border": "#e8e4c8",
+      "--border-bright": "#d0c89c",
+      "--accent": "#92400e",
+      "--accent-dim": "rgba(146,64,14,0.08)",
+      "--accent-fg": "#ffffff",
+      "--text": "#1c1007",
+      "--text-muted": "#6b5230",
+      "--text-dim": "#c8be98",
+      "--error": "#b91c1c",
+      "--error-bg": "rgba(185,28,28,0.06)",
+      "--code-bg": "#f0edd4",
+      "--blockquote-border": "#92400e",
+      "--noise-opacity": "0.2",
+    },
+  },
+  petal: {
+    id: "petal",
+    name: "Petal",
+    dark: false,
+    swatches: ["#fff0f4", "#be185d", "#2d0a18"],
+    vars: {
+      "--bg": "#fff0f4",
+      "--surface": "#fce7ef",
+      "--border": "#f4c2d4",
+      "--border-bright": "#e89ab6",
+      "--accent": "#be185d",
+      "--accent-dim": "rgba(190,24,93,0.08)",
+      "--accent-fg": "#ffffff",
+      "--text": "#2d0a18",
+      "--text-muted": "#7c3254",
+      "--text-dim": "#e89ab6",
+      "--error": "#9f1239",
+      "--error-bg": "rgba(159,18,57,0.06)",
+      "--code-bg": "#f8dde8",
+      "--blockquote-border": "#be185d",
+      "--noise-opacity": "0.14",
+    },
+  },
+  sky: {
+    id: "sky",
+    name: "Sky",
+    dark: false,
+    swatches: ["#f0f9ff", "#0284c7", "#0c1f2e"],
+    vars: {
+      "--bg": "#f0f9ff",
+      "--surface": "#e0f2fe",
+      "--border": "#bae6fd",
+      "--border-bright": "#7dd3fc",
+      "--accent": "#0284c7",
+      "--accent-dim": "rgba(2,132,199,0.1)",
+      "--accent-fg": "#ffffff",
+      "--text": "#0c1f2e",
+      "--text-muted": "#2c6a8e",
+      "--text-dim": "#93c5d8",
+      "--error": "#dc2626",
+      "--error-bg": "rgba(220,38,38,0.06)",
+      "--code-bg": "#cceeff",
+      "--blockquote-border": "#0284c7",
+      "--noise-opacity": "0.12",
+    },
+  },
 };
 
 const DARK_THEMES: ThemeId[] = [
@@ -307,7 +469,16 @@ const DARK_THEMES: ThemeId[] = [
   "nord",
   "forest",
 ];
-const LIGHT_THEMES: ThemeId[] = ["paper", "warm", "solarized"];
+const LIGHT_THEMES: ThemeId[] = [
+  "paper",
+  "warm",
+  "solarized",
+  "github",
+  "mint",
+  "ivory",
+  "petal",
+  "sky",
+];
 
 // ─── Rate Limiting ────────────────────────────────────────────────────────────
 
@@ -379,6 +550,33 @@ function toPlainText(md: string): string {
     .replace(/^---+$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// ─── JSON syntax highlighter ──────────────────────────────────────────────────
+
+function syntaxHighlightJson(obj: object, minified = false): string {
+  const json = minified ? JSON.stringify(obj) : JSON.stringify(obj, null, 2);
+  // HTML-escape unsafe chars before injecting spans
+  const safe = json
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return safe.replace(
+    /("(?:\\u[0-9a-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g,
+    (match) => {
+      let cls: string;
+      if (match.startsWith('"')) {
+        cls = match.trimEnd().endsWith(":") ? "json-key" : "json-string";
+      } else if (match === "true" || match === "false") {
+        cls = "json-bool";
+      } else if (match === "null") {
+        cls = "json-null";
+      } else {
+        cls = "json-number";
+      }
+      return `<span class="${cls}">${match}</span>`;
+    },
+  );
 }
 
 // ─── Theme Dropdown ───────────────────────────────────────────────────────────
@@ -470,9 +668,8 @@ export default function Home() {
   const [result, setResult] = useState<ScrapeResult | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [viewMode, setViewMode] = useState<"markdown" | "plaintext">(
-    "markdown",
-  );
+  const [viewMode, setViewMode] = useState<ViewMode>("markdown");
+  const [jsonMinified, setJsonMinified] = useState(false);
   const [themeId, setThemeId] = useState<ThemeId>("terminal");
   const [rateInfo, setRateInfo] = useState({
     remaining: RATE_LIMIT,
@@ -567,8 +764,16 @@ export default function Home() {
 
   const copyToClipboard = () => {
     if (!result) return;
-    const text =
-      viewMode === "plaintext" ? toPlainText(result.markdown) : result.markdown;
+    let text: string;
+    if (viewMode === "json") {
+      text = jsonMinified
+        ? JSON.stringify(result.structured)
+        : JSON.stringify(result.structured, null, 2);
+    } else if (viewMode === "plaintext") {
+      text = toPlainText(result.markdown);
+    } else {
+      text = result.markdown;
+    }
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -577,9 +782,20 @@ export default function Home() {
 
   const downloadFile = () => {
     if (!result) return;
-    const isPlain = viewMode === "plaintext";
-    const text = isPlain ? toPlainText(result.markdown) : result.markdown;
-    const ext = isPlain ? "txt" : "md";
+    let text: string;
+    let ext: string;
+    if (viewMode === "json") {
+      text = jsonMinified
+        ? JSON.stringify(result.structured)
+        : JSON.stringify(result.structured, null, 2);
+      ext = "json";
+    } else if (viewMode === "plaintext") {
+      text = toPlainText(result.markdown);
+      ext = "txt";
+    } else {
+      text = result.markdown;
+      ext = "md";
+    }
     const blob = new Blob([text], { type: "text/plain" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -679,28 +895,67 @@ export default function Home() {
                 </span>
                 <span className="meta-divider">·</span>
                 <span className="meta-stat">
+                  {result.readingTimeMinutes} min read
+                </span>
+                <span className="meta-divider">·</span>
+                <span className="meta-stat">
                   {(result.charCount / 1024).toFixed(1)} KB
                 </span>
               </div>
               <div className="result-controls">
-                <div className="view-toggle">
+                <div
+                  className="view-toggle"
+                  role="group"
+                  aria-label="View mode"
+                >
                   <button
                     className={`toggle-btn ${viewMode === "markdown" ? "active" : ""}`}
                     onClick={() => setViewMode("markdown")}
+                    aria-pressed={viewMode === "markdown"}
                   >
                     markdown
                   </button>
                   <button
                     className={`toggle-btn ${viewMode === "plaintext" ? "active" : ""}`}
                     onClick={() => setViewMode("plaintext")}
+                    aria-pressed={viewMode === "plaintext"}
                   >
                     plain text
                   </button>
+                  <button
+                    className={`toggle-btn ${viewMode === "json" ? "active" : ""}`}
+                    onClick={() => setViewMode("json")}
+                    aria-pressed={viewMode === "json"}
+                  >
+                    JSON
+                  </button>
                 </div>
-                <button className="action-btn" onClick={copyToClipboard}>
+                {viewMode === "json" && (
+                  <button
+                    className={`action-btn ${jsonMinified ? "active-dim" : ""}`}
+                    onClick={() => setJsonMinified((v) => !v)}
+                    aria-label={
+                      jsonMinified
+                        ? "Switch to pretty JSON"
+                        : "Switch to minified JSON"
+                    }
+                    title={jsonMinified ? "Pretty print" : "Minify"}
+                  >
+                    {jsonMinified ? "pretty" : "minify"}
+                  </button>
+                )}
+                <button
+                  className="action-btn"
+                  onClick={copyToClipboard}
+                  aria-label="Copy to clipboard"
+                >
                   {copied ? "✓ copied" : "copy"}
                 </button>
-                <button className="action-btn" onClick={downloadFile}>
+                <button
+                  className="action-btn"
+                  onClick={downloadFile}
+                  aria-label="Download file"
+                >
                   download
                 </button>
               </div>
@@ -716,6 +971,42 @@ export default function Home() {
                     {displayText}
                   </ReactMarkdown>
                 </div>
+              ) : viewMode === "json" ? (
+                <>
+                  <div className="json-banner">
+                    <span className="json-banner-label">AI context</span>
+                    <span className="json-banner-chips">
+                      <span className="json-chip">
+                        ~
+                        {result.structured.stats.token_estimate.toLocaleString()}{" "}
+                        tokens
+                      </span>
+                      <span className="json-chip">
+                        {result.structured.stats.section_count} sections
+                      </span>
+                      <span className="json-chip">
+                        {result.structured.meta.content_type}
+                      </span>
+                      {result.structured.meta.language !== "en" && (
+                        <span className="json-chip">
+                          {result.structured.meta.language}
+                        </span>
+                      )}
+                    </span>
+                    <span className="json-banner-hint">
+                      Paste this JSON directly into any AI chat to add
+                      structured page context
+                    </span>
+                  </div>
+                  <pre
+                    className="json-body"
+                    dangerouslySetInnerHTML={{
+                      __html: jsonMinified
+                        ? syntaxHighlightJson(result.structured, true)
+                        : syntaxHighlightJson(result.structured, false),
+                    }}
+                  />
+                </>
               ) : (
                 <pre className="plain-body">{displayText}</pre>
               )}
@@ -735,7 +1026,17 @@ export default function Home() {
             </div>
             <div className="hint">
               <span className="hint-icon">03</span>
-              <span>Copy or download as clean Markdown or plain text</span>
+              <span>
+                Copy or download as Markdown, plain text, or structured JSON
+              </span>
+            </div>
+            <div className="hint">
+              <span className="hint-icon">04</span>
+              <span>
+                JSON view generates an AI-ready schema with metadata, sections,
+                token estimate, and compressed content — paste it straight into
+                any chat
+              </span>
             </div>
           </div>
         )}
@@ -932,6 +1233,10 @@ const styles = `
     cursor: pointer; transition: border-color 0.15s, color 0.15s;
   }
   .action-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .action-btn.active-dim {
+    background: var(--accent-dim); border-color: var(--accent);
+    color: var(--accent);
+  }
 
   /* ── Output Area ── */
   .output-area {
@@ -1012,6 +1317,41 @@ const styles = `
   .hint { display: flex; align-items: flex-start; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--border); font-size: 14px; color: var(--text-muted); }
   .hint:first-child { border-top: 1px solid var(--border); }
   .hint-icon { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: var(--accent); flex-shrink: 0; margin-top: 1px; letter-spacing: 0.05em; }
+
+  /* ── JSON Banner ── */
+  .json-banner {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 10px 14px; margin-bottom: 16px;
+    background: var(--accent-dim); border: 1px solid var(--border-bright);
+    border-radius: 4px; font-family: 'IBM Plex Mono', monospace;
+  }
+  .json-banner-label {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--accent); flex-shrink: 0;
+  }
+  .json-banner-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .json-chip {
+    font-size: 10px; color: var(--text-muted);
+    background: var(--surface); border: 1px solid var(--border-bright);
+    border-radius: 10px; padding: 2px 8px; white-space: nowrap;
+  }
+  .json-banner-hint {
+    flex-basis: 100%; font-size: 11px; color: var(--text-muted);
+    font-family: 'DM Sans', sans-serif; margin-top: 2px;
+  }
+
+  /* ── JSON Body ── */
+  .json-body {
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+    line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+    background: transparent; border: none; outline: none;
+    width: 100%; margin: 0; padding: 0; color: var(--text);
+  }
+  .json-key    { color: var(--accent); font-weight: 500; }
+  .json-string { color: var(--text); }
+  .json-number { color: var(--text-muted); }
+  .json-bool   { color: var(--accent); opacity: 0.8; font-style: italic; }
+  .json-null   { color: var(--text-dim); font-style: italic; }
 
   /* ── Responsive ── */
   @media (max-width: 600px) {
