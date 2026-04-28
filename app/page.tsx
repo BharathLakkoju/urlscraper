@@ -673,6 +673,43 @@ function classifyError(msg: string): ErrorContext {
   };
 }
 
+// ─── Combined-context builders ──────────────────────────────────────────────
+// Merge all successful batch results into one document per format.
+
+function buildCombinedMarkdown(items: BatchItem[]): string {
+  return items
+    .filter((it) => it.status === "done" && it.result)
+    .map((it) => {
+      const r = it.result!;
+      return (
+        `---\n` +
+        `**Source:** ${r.url}  \n` +
+        `**Title:** ${r.title || "Untitled"}  \n` +
+        `**Words:** ${r.wordCount.toLocaleString()}  \n` +
+        `---\n\n` +
+        r.markdown
+      );
+    })
+    .join("\n\n");
+}
+
+function buildCombinedToon(items: BatchItem[]): string {
+  const done = items.filter((it) => it.status === "done" && it.result);
+  return done
+    .map(
+      (it, i) =>
+        `===[ ${i + 1}/${done.length} ]===\n${toToonFormat(it.result!)}`,
+    )
+    .join("\n\n");
+}
+
+function buildCombinedJson(items: BatchItem[], minified: boolean): string {
+  const payload = items
+    .filter((it) => it.status === "done" && it.result)
+    .map((it) => it.result!.structured);
+  return minified ? JSON.stringify(payload) : JSON.stringify(payload, null, 2);
+}
+
 function toPlainText(md: string): string {
   return md
     .replace(/^#{1,6}\s+/gm, "")
@@ -1048,74 +1085,84 @@ export default function Home() {
     if (e.key === "Enter") scrape();
   };
 
-  // Resolve active result: batch mode uses the selected tab's result, single uses result
-  const activeResult: ScrapeResult | null = batchMode
-    ? (batchResults[activeIdx]?.result ?? null)
-    : result;
-  const activeError: string = batchMode
-    ? (batchResults[activeIdx]?.error ?? "")
-    : error;
-  const activeItemStatus = batchMode
-    ? (batchResults[activeIdx]?.status ?? "pending")
-    : status === "success"
-      ? "done"
-      : status === "error"
-        ? "error"
-        : status === "loading"
-          ? "loading"
-          : "pending";
+  // activeIdx === -1 means the "all combined" tab
+  const isCombinedTab = batchMode && activeIdx === -1;
 
-  const copyToClipboard = () => {
-    if (!activeResult) return;
-    let text: string;
-    if (viewMode === "json") {
-      text = jsonMinified
+  // Resolve active result: batch mode uses the selected tab's result, single uses result
+  const activeResult: ScrapeResult | null = isCombinedTab
+    ? null
+    : batchMode
+      ? (batchResults[activeIdx]?.result ?? null)
+      : result;
+  const activeError: string = isCombinedTab
+    ? ""
+    : batchMode
+      ? (batchResults[activeIdx]?.error ?? "")
+      : error;
+  const activeItemStatus = isCombinedTab
+    ? "done"
+    : batchMode
+      ? (batchResults[activeIdx]?.status ?? "pending")
+      : status === "success"
+        ? "done"
+        : status === "error"
+          ? "error"
+          : status === "loading"
+            ? "loading"
+            : "pending";
+
+  const getTextForMode = (mode: ViewMode): string => {
+    if (isCombinedTab) {
+      if (mode === "json") return buildCombinedJson(batchResults, jsonMinified);
+      if (mode === "toon") return buildCombinedToon(batchResults);
+      if (mode === "plaintext")
+        return toPlainText(buildCombinedMarkdown(batchResults));
+      return buildCombinedMarkdown(batchResults);
+    }
+    if (!activeResult) return "";
+    if (mode === "json")
+      return jsonMinified
         ? JSON.stringify(activeResult.structured)
         : JSON.stringify(activeResult.structured, null, 2);
-    } else if (viewMode === "plaintext") {
-      text = toPlainText(activeResult.markdown);
-    } else if (viewMode === "toon") {
-      text = toToonFormat(activeResult);
-    } else {
-      text = activeResult.markdown;
-    }
-    navigator.clipboard.writeText(text).then(() => {
+    if (mode === "plaintext") return toPlainText(activeResult.markdown);
+    if (mode === "toon") return toToonFormat(activeResult);
+    return activeResult.markdown;
+  };
+
+  const copyToClipboard = () => {
+    if (!isCombinedTab && !activeResult) return;
+    navigator.clipboard.writeText(getTextForMode(viewMode)).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
   };
 
   const downloadFile = () => {
-    if (!activeResult) return;
-    let text: string;
-    let ext: string;
-    if (viewMode === "json") {
-      text = jsonMinified
-        ? JSON.stringify(activeResult.structured)
-        : JSON.stringify(activeResult.structured, null, 2);
-      ext = "json";
-    } else if (viewMode === "plaintext") {
-      text = toPlainText(activeResult.markdown);
-      ext = "txt";
-    } else if (viewMode === "toon") {
-      text = toToonFormat(activeResult);
-      ext = "toon.txt";
-    } else {
-      text = activeResult.markdown;
-      ext = "md";
-    }
+    if (!isCombinedTab && !activeResult) return;
+    const text = getTextForMode(viewMode);
+    const extMap: Record<ViewMode, string> = {
+      json: "json",
+      plaintext: "txt",
+      toon: "toon.txt",
+      markdown: "md",
+    };
+    const prefix = isCombinedTab ? "combined" : "scraped";
     const blob = new Blob([text], { type: "text/plain" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `scraped-${Date.now()}.${ext}`;
+    a.download = `${prefix}-${Date.now()}.${extMap[viewMode]}`;
     a.click();
   };
 
-  const displayText = activeResult
+  const displayText = isCombinedTab
     ? viewMode === "plaintext"
-      ? toPlainText(activeResult.markdown)
-      : activeResult.markdown
-    : "";
+      ? toPlainText(buildCombinedMarkdown(batchResults))
+      : buildCombinedMarkdown(batchResults)
+    : activeResult
+      ? viewMode === "plaintext"
+        ? toPlainText(activeResult.markdown)
+        : activeResult.markdown
+      : "";
 
   const showRateBar = rateInfo.remaining < RATE_LIMIT;
   const hasBatchResults = batchMode && batchResults.length > 0;
@@ -1281,40 +1328,61 @@ export default function Home() {
         {showResults && (
           <div className="result-section">
             {/* ── Batch tabs ── */}
-            {hasBatchResults && (
-              <div
-                className="batch-tabs"
-                role="tablist"
-                aria-label="Scraped pages"
-              >
-                {batchResults.map((item, i) => (
-                  <button
-                    key={i}
-                    role="tab"
-                    aria-selected={activeIdx === i}
-                    className={`batch-tab batch-tab-${item.status}${activeIdx === i ? " active" : ""}`}
-                    onClick={() => setActiveIdx(i)}
-                    title={item.url}
+            {hasBatchResults &&
+              (() => {
+                const doneCount = batchResults.filter(
+                  (it) => it.status === "done",
+                ).length;
+                return (
+                  <div
+                    className="batch-tabs"
+                    role="tablist"
+                    aria-label="Scraped pages"
                   >
-                    <span className="batch-tab-indicator">
-                      {item.status === "loading" ? (
-                        <span className="batch-spinner" />
-                      ) : item.status === "done" ? (
-                        "✓"
-                      ) : item.status === "error" ? (
-                        "✗"
-                      ) : (
-                        "·"
-                      )}
-                    </span>
-                    {i + 1}
-                  </button>
-                ))}
-              </div>
-            )}
+                    {doneCount > 1 && (
+                      <button
+                        role="tab"
+                        aria-selected={activeIdx === -1}
+                        className={`batch-tab batch-tab-combined${activeIdx === -1 ? " active" : ""}`}
+                        onClick={() => setActiveIdx(-1)}
+                        title="Combined context of all scraped pages"
+                      >
+                        <span className="batch-tab-indicator">⊕</span>
+                        all
+                      </button>
+                    )}
+                    {batchResults.map((item, i) => (
+                      <button
+                        key={i}
+                        role="tab"
+                        aria-selected={activeIdx === i}
+                        className={`batch-tab batch-tab-${item.status}${activeIdx === i ? " active" : ""}`}
+                        onClick={() => setActiveIdx(i)}
+                        title={item.url}
+                      >
+                        <span className="batch-tab-indicator">
+                          {item.status === "loading" ? (
+                            <span className="batch-spinner" />
+                          ) : item.status === "done" ? (
+                            "✓"
+                          ) : item.status === "error" ? (
+                            "✗"
+                          ) : (
+                            "·"
+                          )}
+                        </span>
+                        {i + 1}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
 
             {/* ── Per-item inline error (batch) ── */}
-            {batchMode && activeItemStatus === "error" && activeError ? (
+            {batchMode &&
+            !isCombinedTab &&
+            activeItemStatus === "error" &&
+            activeError ? (
               (() => {
                 const ctx = classifyError(activeError);
                 return (
@@ -1331,7 +1399,10 @@ export default function Home() {
                   </div>
                 );
               })()
-            ) : batchMode && activeItemStatus === "loading" && !activeResult ? (
+            ) : batchMode &&
+              !isCombinedTab &&
+              activeItemStatus === "loading" &&
+              !activeResult ? (
               <div className="batch-item-loading">
                 <span
                   className="spinner"
@@ -1339,25 +1410,50 @@ export default function Home() {
                 />
                 <span>Scraping…</span>
               </div>
-            ) : activeResult ? (
+            ) : isCombinedTab || activeResult ? (
               <>
                 <div className="result-header">
                   <div className="result-meta">
-                    <span className="meta-title">
-                      {activeResult.title || "Untitled"}
-                    </span>
-                    <span className="meta-divider">·</span>
-                    <span className="meta-stat">
-                      {activeResult.wordCount.toLocaleString()} words
-                    </span>
-                    <span className="meta-divider">·</span>
-                    <span className="meta-stat">
-                      {activeResult.readingTimeMinutes} min read
-                    </span>
-                    <span className="meta-divider">·</span>
-                    <span className="meta-stat">
-                      {(activeResult.charCount / 1024).toFixed(1)} KB
-                    </span>
+                    {isCombinedTab ? (
+                      (() => {
+                        const done = batchResults.filter(
+                          (it) => it.status === "done" && it.result,
+                        );
+                        const totalWords = done.reduce(
+                          (s, it) => s + it.result!.wordCount,
+                          0,
+                        );
+                        return (
+                          <>
+                            <span className="meta-title">
+                              Combined — {done.length} pages
+                            </span>
+                            <span className="meta-divider">·</span>
+                            <span className="meta-stat">
+                              {totalWords.toLocaleString()} words total
+                            </span>
+                          </>
+                        );
+                      })()
+                    ) : (
+                      <>
+                        <span className="meta-title">
+                          {activeResult!.title || "Untitled"}
+                        </span>
+                        <span className="meta-divider">·</span>
+                        <span className="meta-stat">
+                          {activeResult!.wordCount.toLocaleString()} words
+                        </span>
+                        <span className="meta-divider">·</span>
+                        <span className="meta-stat">
+                          {activeResult!.readingTimeMinutes} min read
+                        </span>
+                        <span className="meta-divider">·</span>
+                        <span className="meta-stat">
+                          {(activeResult!.charCount / 1024).toFixed(1)} KB
+                        </span>
+                      </>
+                    )}
                   </div>
                   <div className="result-controls">
                     <div
@@ -1453,54 +1549,87 @@ export default function Home() {
                   ) : viewMode === "json" ? (
                     <>
                       <div className="json-banner">
-                        <span className="json-banner-label">AI context</span>
+                        <span className="json-banner-label">
+                          {isCombinedTab ? "Combined JSON" : "AI context"}
+                        </span>
                         <span className="json-banner-chips">
-                          <span className="json-chip">
-                            ~
-                            {activeResult.structured.stats.token_estimate.toLocaleString()}{" "}
-                            tokens
-                          </span>
-                          <span className="json-chip">
-                            {activeResult.structured.stats.section_count}{" "}
-                            sections
-                          </span>
-                          <span className="json-chip">
-                            {activeResult.structured.meta.content_type}
-                          </span>
-                          {activeResult.structured.meta.language !== "en" && (
+                          {isCombinedTab ? (
                             <span className="json-chip">
-                              {activeResult.structured.meta.language}
+                              {
+                                batchResults.filter(
+                                  (it) => it.status === "done",
+                                ).length
+                              }{" "}
+                              pages
                             </span>
+                          ) : (
+                            <>
+                              <span className="json-chip">
+                                ~
+                                {activeResult!.structured.stats.token_estimate.toLocaleString()}{" "}
+                                tokens
+                              </span>
+                              <span className="json-chip">
+                                {activeResult!.structured.stats.section_count}{" "}
+                                sections
+                              </span>
+                              <span className="json-chip">
+                                {activeResult!.structured.meta.content_type}
+                              </span>
+                              {activeResult!.structured.meta.language !==
+                                "en" && (
+                                <span className="json-chip">
+                                  {activeResult!.structured.meta.language}
+                                </span>
+                              )}
+                            </>
                           )}
                         </span>
                         <span className="json-banner-hint">
-                          Paste this JSON directly into any AI chat to add
-                          structured page context
+                          {isCombinedTab
+                            ? "Array of all scraped pages — paste into any AI chat for full multi-page context"
+                            : "Paste this JSON directly into any AI chat to add structured page context"}
                         </span>
                       </div>
                       <pre
                         className="json-body"
                         dangerouslySetInnerHTML={{
-                          __html: syntaxHighlightJson(
-                            activeResult.structured,
-                            jsonMinified,
-                          ),
+                          __html: isCombinedTab
+                            ? syntaxHighlightJson(
+                                batchResults
+                                  .filter(
+                                    (it) => it.status === "done" && it.result,
+                                  )
+                                  .map((it) => it.result!.structured),
+                                jsonMinified,
+                              )
+                            : syntaxHighlightJson(
+                                activeResult!.structured,
+                                jsonMinified,
+                              ),
                         }}
                       />
                     </>
                   ) : viewMode === "toon" ? (
                     (() => {
-                      const toon = toToonFormat(activeResult);
+                      const toon = isCombinedTab
+                        ? buildCombinedToon(batchResults)
+                        : toToonFormat(activeResult!);
                       const toonTokens = Math.ceil(toon.length / 4);
-                      const jsonTokens =
-                        activeResult.structured.stats.token_estimate;
+                      const jsonTokens = isCombinedTab
+                        ? Math.ceil(
+                            buildCombinedJson(batchResults, false).length / 4,
+                          )
+                        : activeResult!.structured.stats.token_estimate;
                       const saving = Math.round(
                         (1 - toonTokens / jsonTokens) * 100,
                       );
                       return (
                         <>
                           <div className="json-banner">
-                            <span className="json-banner-label">TOON</span>
+                            <span className="json-banner-label">
+                              {isCombinedTab ? "Combined TOON" : "TOON"}
+                            </span>
                             <span className="json-banner-chips">
                               <span className="json-chip">
                                 ~{toonTokens.toLocaleString()} tokens
@@ -1510,13 +1639,16 @@ export default function Home() {
                                   {saving}% smaller than JSON
                                 </span>
                               )}
-                              <span className="json-chip">
-                                {activeResult.structured.meta.content_type}
-                              </span>
+                              {!isCombinedTab && (
+                                <span className="json-chip">
+                                  {activeResult!.structured.meta.content_type}
+                                </span>
+                              )}
                             </span>
                             <span className="json-banner-hint">
-                              Text-Only Optimized Notation — structured but
-                              compact, ideal for token-limited AI chats
+                              {isCombinedTab
+                                ? `All ${batchResults.filter((it) => it.status === "done").length} pages in compact TOON notation — minimal tokens, maximum context`
+                                : "Text-Only Optimized Notation — structured but compact, ideal for token-limited AI chats"}
                             </span>
                           </div>
                           <pre className="toon-body">{toon}</pre>
@@ -1798,6 +1930,8 @@ const styles = `
   .batch-tab.batch-tab-done .batch-tab-indicator { color: var(--accent); }
   .batch-tab.batch-tab-error { border-color: rgba(220,38,38,0.3); }
   .batch-tab.batch-tab-error .batch-tab-indicator { color: var(--error); }
+  .batch-tab.batch-tab-combined .batch-tab-indicator { color: var(--accent); opacity: 0.7; }
+  .batch-tab.batch-tab-combined { font-weight: 500; }
   .batch-spinner {
     display: inline-block; width: 10px; height: 10px;
     border: 1.5px solid rgba(128,128,128,0.2);
@@ -1819,7 +1953,7 @@ const styles = `
   }
   .result-header {
     display: flex; align-items: flex-start; justify-content: space-between;
-    flex-wrap: wrap; gap: 10px; padding: 12px 0; margin-bottom: 8px;
+    flex-direction: column; gap: 10px; padding: 12px 0; margin-bottom: 8px;
     border-bottom: 1px solid var(--border);
   }
   .result-meta {
