@@ -56,7 +56,13 @@ type ScrapeResult = {
 };
 
 type Status = "idle" | "loading" | "success" | "error";
-type ViewMode = "markdown" | "plaintext" | "json";
+type ViewMode = "markdown" | "plaintext" | "json" | "toon";
+type BatchItem = {
+  url: string;
+  result: ScrapeResult | null;
+  error: string;
+  status: "pending" | "loading" | "done" | "error";
+};
 type ThemeId =
   | "terminal"
   | "midnight"
@@ -685,6 +691,66 @@ function toPlainText(md: string): string {
     .trim();
 }
 
+// ─── TOON format (Text-Only Optimized Notation) ───────────────────────────────
+// Compact, token-efficient structured text — ~50% fewer tokens than JSON.
+// @key:value metadata lines + section headings with word counts.
+
+function toToonFormat(result: ScrapeResult): string {
+  const s = result.structured;
+  const lines: string[] = [];
+
+  // Header metadata
+  lines.push(`@title:${s.meta.title}`);
+  lines.push(`@url:${s.source.url}`);
+  lines.push(
+    `@type:${s.meta.content_type} @lang:${s.meta.language} ` +
+      `@words:${s.stats.word_count} @read:${s.stats.reading_time_minutes}m ` +
+      `@tokens:~${s.stats.token_estimate}`,
+  );
+  if (s.meta.description) lines.push(`@desc:${s.meta.description}`);
+  if (s.meta.author) lines.push(`@by:${s.meta.author}`);
+  if (s.meta.published) lines.push(`@pub:${s.meta.published.slice(0, 10)}`);
+  if (s.meta.keywords?.length)
+    lines.push(`@keys:${s.meta.keywords.slice(0, 8).join(", ")}`);
+  lines.push("");
+  lines.push(`@summ:${s.summary}`);
+  lines.push("");
+  lines.push("---");
+
+  // Sections
+  for (const sec of s.sections) {
+    if (sec.heading) {
+      lines.push(
+        `${"#".repeat(Math.max(1, sec.level))} ${sec.heading} [${sec.word_count}w]`,
+      );
+    }
+    if (sec.body) {
+      const body =
+        sec.body.length > 600
+          ? sec.body.slice(0, 600).replace(/\s+\S*$/, "") + "…"
+          : sec.body;
+      lines.push(body);
+    }
+    lines.push("");
+  }
+
+  // Code blocks
+  if (s.code_blocks?.length) {
+    lines.push("---code---");
+    for (const cb of s.code_blocks) {
+      lines.push(`[${cb.language || "code"}]`);
+      const code = cb.code.length > 400 ? cb.code.slice(0, 400) + "…" : cb.code;
+      lines.push(code);
+      lines.push("");
+    }
+  }
+
+  return lines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // ─── JSON syntax highlighter ──────────────────────────────────────────────────
 
 function syntaxHighlightJson(obj: object, minified = false): string {
@@ -808,6 +874,10 @@ export default function Home() {
     remaining: RATE_LIMIT,
     resetIn: 0,
   });
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchUrls, setBatchUrls] = useState("");
+  const [batchResults, setBatchResults] = useState<BatchItem[]>([]);
+  const [activeIdx, setActiveIdx] = useState(0);
 
   // Load saved theme and initial rate info
   useEffect(() => {
@@ -841,6 +911,15 @@ export default function Home() {
     localStorage.setItem("scraper_theme", id);
   };
 
+  const toggleBatchMode = () => {
+    setBatchMode((v) => !v);
+    setBatchResults([]);
+    setActiveIdx(0);
+    setStatus("idle");
+    setResult(null);
+    setError("");
+  };
+
   // Live rate-limit ticker — refreshes every second while any requests are in use
   useEffect(() => {
     if (rateInfo.remaining >= RATE_LIMIT) return;
@@ -849,6 +928,74 @@ export default function Home() {
   }, [rateInfo.remaining]);
 
   const scrape = useCallback(async () => {
+    if (batchMode) {
+      const rawLines = batchUrls
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .slice(0, 10);
+      if (!rawLines.length) return;
+
+      const info = getRateLimitInfo();
+      if (info.remaining < rawLines.length) {
+        setError(
+          `Not enough slots (need ${rawLines.length}, have ${info.remaining}). Wait for the timer to reset.`,
+        );
+        setStatus("error");
+        return;
+      }
+
+      const initial: BatchItem[] = rawLines.map((u) => ({
+        url: u,
+        result: null,
+        error: "",
+        status: "loading",
+      }));
+      setBatchResults(initial);
+      setActiveIdx(0);
+      setStatus("loading");
+      setError("");
+
+      await Promise.allSettled(
+        rawLines.map(async (rawUrl, i) => {
+          let finalUrl = rawUrl;
+          if (
+            !finalUrl.startsWith("http://") &&
+            !finalUrl.startsWith("https://")
+          ) {
+            finalUrl = "https://" + finalUrl;
+          }
+          recordRequest();
+          setRateInfo(getRateLimitInfo());
+          try {
+            const data = await scrapeUrl(finalUrl);
+            setBatchResults((prev) =>
+              prev.map((r, j) =>
+                j === i ? { ...r, result: data, status: "done" } : r,
+              ),
+            );
+          } catch (e: unknown) {
+            setBatchResults((prev) =>
+              prev.map((r, j) =>
+                j === i
+                  ? {
+                      ...r,
+                      error: e instanceof Error ? e.message : "Failed",
+                      status: "error",
+                    }
+                  : r,
+              ),
+            );
+          }
+        }),
+      );
+
+      setStatus("success");
+      setRateInfo(getRateLimitInfo());
+      return;
+    }
+
+    // ── Single mode ──────────────────────────────────────────────────────────
     const trimmed = url.trim();
     if (!trimmed) return;
 
@@ -864,7 +1011,6 @@ export default function Home() {
       finalUrl = "https://" + finalUrl;
     }
 
-    // Client-side validation
     if (finalUrl.length > 2048) {
       setError("URL is too long (max 2048 characters).");
       setStatus("error");
@@ -896,23 +1042,42 @@ export default function Home() {
       setError(e instanceof Error ? e.message : "Something went wrong");
       setStatus("error");
     }
-  }, [url]);
+  }, [url, batchMode, batchUrls]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") scrape();
   };
 
+  // Resolve active result: batch mode uses the selected tab's result, single uses result
+  const activeResult: ScrapeResult | null = batchMode
+    ? (batchResults[activeIdx]?.result ?? null)
+    : result;
+  const activeError: string = batchMode
+    ? (batchResults[activeIdx]?.error ?? "")
+    : error;
+  const activeItemStatus = batchMode
+    ? (batchResults[activeIdx]?.status ?? "pending")
+    : status === "success"
+      ? "done"
+      : status === "error"
+        ? "error"
+        : status === "loading"
+          ? "loading"
+          : "pending";
+
   const copyToClipboard = () => {
-    if (!result) return;
+    if (!activeResult) return;
     let text: string;
     if (viewMode === "json") {
       text = jsonMinified
-        ? JSON.stringify(result.structured)
-        : JSON.stringify(result.structured, null, 2);
+        ? JSON.stringify(activeResult.structured)
+        : JSON.stringify(activeResult.structured, null, 2);
     } else if (viewMode === "plaintext") {
-      text = toPlainText(result.markdown);
+      text = toPlainText(activeResult.markdown);
+    } else if (viewMode === "toon") {
+      text = toToonFormat(activeResult);
     } else {
-      text = result.markdown;
+      text = activeResult.markdown;
     }
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
@@ -921,19 +1086,22 @@ export default function Home() {
   };
 
   const downloadFile = () => {
-    if (!result) return;
+    if (!activeResult) return;
     let text: string;
     let ext: string;
     if (viewMode === "json") {
       text = jsonMinified
-        ? JSON.stringify(result.structured)
-        : JSON.stringify(result.structured, null, 2);
+        ? JSON.stringify(activeResult.structured)
+        : JSON.stringify(activeResult.structured, null, 2);
       ext = "json";
     } else if (viewMode === "plaintext") {
-      text = toPlainText(result.markdown);
+      text = toPlainText(activeResult.markdown);
       ext = "txt";
+    } else if (viewMode === "toon") {
+      text = toToonFormat(activeResult);
+      ext = "toon.txt";
     } else {
-      text = result.markdown;
+      text = activeResult.markdown;
       ext = "md";
     }
     const blob = new Blob([text], { type: "text/plain" });
@@ -943,13 +1111,17 @@ export default function Home() {
     a.click();
   };
 
-  const displayText = result
+  const displayText = activeResult
     ? viewMode === "plaintext"
-      ? toPlainText(result.markdown)
-      : result.markdown
+      ? toPlainText(activeResult.markdown)
+      : activeResult.markdown
     : "";
 
   const showRateBar = rateInfo.remaining < RATE_LIMIT;
+  const hasBatchResults = batchMode && batchResults.length > 0;
+  const showResults =
+    (!batchMode && status === "success" && result) ||
+    (batchMode && batchResults.length > 0);
 
   return (
     <div className="page" data-theme={themeId}>
@@ -971,28 +1143,61 @@ export default function Home() {
 
       <main>
         <div className="input-section">
+          {/* ── Batch mode toggle ── */}
+          <div className="batch-toggle-row">
+            <button
+              className={`batch-toggle-btn ${batchMode ? "active" : ""}`}
+              onClick={toggleBatchMode}
+              aria-pressed={batchMode}
+            >
+              {batchMode ? "✕ single URL" : "+ batch (up to 10)"}
+            </button>
+            {batchMode && <span className="batch-hint">one URL per line</span>}
+          </div>
+
           <div
-            className={`input-wrapper ${status === "loading" ? "loading" : ""}`}
+            className={`input-wrapper ${status === "loading" ? "loading" : ""} ${batchMode ? "batch" : ""}`}
           >
-            <input
-              className="url-input"
-              type="text"
-              placeholder="https://example.com/article"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={handleKeyDown}
-              disabled={status === "loading"}
-              spellCheck={false}
-              autoCapitalize="none"
-              autoCorrect="off"
-            />
+            {batchMode ? (
+              <textarea
+                className="url-textarea"
+                placeholder={
+                  "https://example.com/page-1\nhttps://example.com/page-2\nhttps://example.com/page-3"
+                }
+                value={batchUrls}
+                onChange={(e) => setBatchUrls(e.target.value)}
+                disabled={status === "loading"}
+                spellCheck={false}
+                autoCapitalize="none"
+                autoCorrect="off"
+                rows={4}
+              />
+            ) : (
+              <input
+                className="url-input"
+                type="text"
+                placeholder="https://example.com/article"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onKeyDown={handleKeyDown}
+                disabled={status === "loading"}
+                spellCheck={false}
+                autoCapitalize="none"
+                autoCorrect="off"
+              />
+            )}
             <button
               className="scrape-btn"
               onClick={scrape}
-              disabled={!url.trim() || status === "loading"}
+              disabled={
+                (!batchMode ? !url.trim() : !batchUrls.trim()) ||
+                status === "loading"
+              }
             >
               {status === "loading" ? (
                 <span className="spinner" />
+              ) : batchMode ? (
+                "extract all →"
               ) : (
                 "extract →"
               )}
@@ -1040,7 +1245,9 @@ export default function Home() {
           )}
         </div>
 
-        {status === "error" &&
+        {/* ── Single-mode error ── */}
+        {!batchMode &&
+          status === "error" &&
           (() => {
             const ctx = classifyError(error);
             return (
@@ -1058,147 +1265,274 @@ export default function Home() {
             );
           })()}
 
-        {status === "success" && result && (
-          <div className="result-section">
-            <div className="result-header">
-              <div className="result-meta">
-                <span className="meta-title">{result.title || "Untitled"}</span>
-                <span className="meta-divider">·</span>
-                <span className="meta-stat">
-                  {result.wordCount.toLocaleString()} words
-                </span>
-                <span className="meta-divider">·</span>
-                <span className="meta-stat">
-                  {result.readingTimeMinutes} min read
-                </span>
-                <span className="meta-divider">·</span>
-                <span className="meta-stat">
-                  {(result.charCount / 1024).toFixed(1)} KB
-                </span>
-              </div>
-              <div className="result-controls">
-                <div
-                  className="view-toggle"
-                  role="group"
-                  aria-label="View mode"
-                >
-                  <button
-                    className={`toggle-btn ${viewMode === "markdown" ? "active" : ""}`}
-                    onClick={() => setViewMode("markdown")}
-                    aria-pressed={viewMode === "markdown"}
-                  >
-                    markdown
-                  </button>
-                  <button
-                    className={`toggle-btn ${viewMode === "plaintext" ? "active" : ""}`}
-                    onClick={() => setViewMode("plaintext")}
-                    aria-pressed={viewMode === "plaintext"}
-                  >
-                    plain text
-                  </button>
-                  <button
-                    className={`toggle-btn ${viewMode === "json" ? "active" : ""}`}
-                    onClick={() => setViewMode("json")}
-                    aria-pressed={viewMode === "json"}
-                  >
-                    JSON
-                  </button>
-                </div>
-                {viewMode === "json" && (
-                  <button
-                    className={`action-btn ${jsonMinified ? "active-dim" : ""}`}
-                    onClick={() => setJsonMinified((v) => !v)}
-                    aria-label={
-                      jsonMinified
-                        ? "Switch to pretty JSON"
-                        : "Switch to minified JSON"
-                    }
-                    title={jsonMinified ? "Pretty print" : "Minify"}
-                  >
-                    {jsonMinified ? "pretty" : "minify"}
-                  </button>
-                )}
-                <button
-                  className="action-btn"
-                  onClick={copyToClipboard}
-                  aria-label={`Copy as ${viewMode === "json" ? "JSON" : viewMode === "plaintext" ? "plain text" : "Markdown"}`}
-                >
-                  {copied
-                    ? "✓ copied"
-                    : viewMode === "json"
-                      ? "copy .json"
-                      : viewMode === "plaintext"
-                        ? "copy .txt"
-                        : "copy .md"}
-                </button>
-                <button
-                  className="action-btn"
-                  onClick={downloadFile}
-                  aria-label={`Download as ${viewMode === "json" ? "JSON" : viewMode === "plaintext" ? "plain text" : "Markdown"}`}
-                >
-                  {viewMode === "json"
-                    ? "download .json"
-                    : viewMode === "plaintext"
-                      ? "download .txt"
-                      : "download .md"}
-                </button>
-              </div>
-            </div>
-
-            <div className="output-area">
-              {viewMode === "markdown" ? (
-                <div className="md-body">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    rehypePlugins={[rehypeSanitize]}
-                  >
-                    {displayText}
-                  </ReactMarkdown>
-                </div>
-              ) : viewMode === "json" ? (
-                <>
-                  <div className="json-banner">
-                    <span className="json-banner-label">AI context</span>
-                    <span className="json-banner-chips">
-                      <span className="json-chip">
-                        ~
-                        {result.structured.stats.token_estimate.toLocaleString()}{" "}
-                        tokens
-                      </span>
-                      <span className="json-chip">
-                        {result.structured.stats.section_count} sections
-                      </span>
-                      <span className="json-chip">
-                        {result.structured.meta.content_type}
-                      </span>
-                      {result.structured.meta.language !== "en" && (
-                        <span className="json-chip">
-                          {result.structured.meta.language}
-                        </span>
-                      )}
-                    </span>
-                    <span className="json-banner-hint">
-                      Paste this JSON directly into any AI chat to add
-                      structured page context
-                    </span>
-                  </div>
-                  <pre
-                    className="json-body"
-                    dangerouslySetInnerHTML={{
-                      __html: jsonMinified
-                        ? syntaxHighlightJson(result.structured, true)
-                        : syntaxHighlightJson(result.structured, false),
-                    }}
-                  />
-                </>
-              ) : (
-                <pre className="plain-body">{displayText}</pre>
-              )}
+        {/* ── Batch pre-flight error ── */}
+        {batchMode && status === "error" && error && (
+          <div className="error-card">
+            <span className="error-icon">✕</span>
+            <div className="error-body">
+              <span className="error-headline">Batch couldn't start</span>
+              <ul className="error-reasons">
+                <li>{error}</li>
+              </ul>
             </div>
           </div>
         )}
 
-        {status === "idle" && (
+        {showResults && (
+          <div className="result-section">
+            {/* ── Batch tabs ── */}
+            {hasBatchResults && (
+              <div
+                className="batch-tabs"
+                role="tablist"
+                aria-label="Scraped pages"
+              >
+                {batchResults.map((item, i) => (
+                  <button
+                    key={i}
+                    role="tab"
+                    aria-selected={activeIdx === i}
+                    className={`batch-tab batch-tab-${item.status}${activeIdx === i ? " active" : ""}`}
+                    onClick={() => setActiveIdx(i)}
+                    title={item.url}
+                  >
+                    <span className="batch-tab-indicator">
+                      {item.status === "loading" ? (
+                        <span className="batch-spinner" />
+                      ) : item.status === "done" ? (
+                        "✓"
+                      ) : item.status === "error" ? (
+                        "✗"
+                      ) : (
+                        "·"
+                      )}
+                    </span>
+                    {i + 1}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* ── Per-item inline error (batch) ── */}
+            {batchMode && activeItemStatus === "error" && activeError ? (
+              (() => {
+                const ctx = classifyError(activeError);
+                return (
+                  <div className="error-card" style={{ marginBottom: 16 }}>
+                    <span className="error-icon">✕</span>
+                    <div className="error-body">
+                      <span className="error-headline">{ctx.headline}</span>
+                      <ul className="error-reasons">
+                        {ctx.reasons.map((r, i) => (
+                          <li key={i}>{r}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                );
+              })()
+            ) : batchMode && activeItemStatus === "loading" && !activeResult ? (
+              <div className="batch-item-loading">
+                <span
+                  className="spinner"
+                  style={{ borderTopColor: "var(--accent)" }}
+                />
+                <span>Scraping…</span>
+              </div>
+            ) : activeResult ? (
+              <>
+                <div className="result-header">
+                  <div className="result-meta">
+                    <span className="meta-title">
+                      {activeResult.title || "Untitled"}
+                    </span>
+                    <span className="meta-divider">·</span>
+                    <span className="meta-stat">
+                      {activeResult.wordCount.toLocaleString()} words
+                    </span>
+                    <span className="meta-divider">·</span>
+                    <span className="meta-stat">
+                      {activeResult.readingTimeMinutes} min read
+                    </span>
+                    <span className="meta-divider">·</span>
+                    <span className="meta-stat">
+                      {(activeResult.charCount / 1024).toFixed(1)} KB
+                    </span>
+                  </div>
+                  <div className="result-controls">
+                    <div
+                      className="view-toggle"
+                      role="group"
+                      aria-label="View mode"
+                    >
+                      <button
+                        className={`toggle-btn ${viewMode === "markdown" ? "active" : ""}`}
+                        onClick={() => setViewMode("markdown")}
+                        aria-pressed={viewMode === "markdown"}
+                      >
+                        md
+                      </button>
+                      <button
+                        className={`toggle-btn ${viewMode === "plaintext" ? "active" : ""}`}
+                        onClick={() => setViewMode("plaintext")}
+                        aria-pressed={viewMode === "plaintext"}
+                      >
+                        txt
+                      </button>
+                      <button
+                        className={`toggle-btn ${viewMode === "json" ? "active" : ""}`}
+                        onClick={() => setViewMode("json")}
+                        aria-pressed={viewMode === "json"}
+                      >
+                        JSON
+                      </button>
+                      <button
+                        className={`toggle-btn ${viewMode === "toon" ? "active" : ""}`}
+                        onClick={() => setViewMode("toon")}
+                        aria-pressed={viewMode === "toon"}
+                        title="Text-Only Optimized Notation — ~50% fewer tokens than JSON"
+                      >
+                        TOON
+                      </button>
+                    </div>
+                    {viewMode === "json" && (
+                      <button
+                        className={`action-btn ${jsonMinified ? "active-dim" : ""}`}
+                        onClick={() => setJsonMinified((v) => !v)}
+                        aria-label={
+                          jsonMinified
+                            ? "Switch to pretty JSON"
+                            : "Switch to minified JSON"
+                        }
+                        title={jsonMinified ? "Pretty print" : "Minify"}
+                      >
+                        {jsonMinified ? "pretty" : "minify"}
+                      </button>
+                    )}
+                    <button
+                      className="action-btn"
+                      onClick={copyToClipboard}
+                      aria-label={`Copy as ${viewMode}`}
+                    >
+                      {copied
+                        ? "✓ copied"
+                        : viewMode === "json"
+                          ? "copy .json"
+                          : viewMode === "plaintext"
+                            ? "copy .txt"
+                            : viewMode === "toon"
+                              ? "copy .toon"
+                              : "copy .md"}
+                    </button>
+                    <button
+                      className="action-btn"
+                      onClick={downloadFile}
+                      aria-label={`Download as ${viewMode}`}
+                    >
+                      {viewMode === "json"
+                        ? "↓ .json"
+                        : viewMode === "plaintext"
+                          ? "↓ .txt"
+                          : viewMode === "toon"
+                            ? "↓ .toon"
+                            : "↓ .md"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="output-area">
+                  {viewMode === "markdown" ? (
+                    <div className="md-body">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        rehypePlugins={[rehypeSanitize]}
+                      >
+                        {displayText}
+                      </ReactMarkdown>
+                    </div>
+                  ) : viewMode === "json" ? (
+                    <>
+                      <div className="json-banner">
+                        <span className="json-banner-label">AI context</span>
+                        <span className="json-banner-chips">
+                          <span className="json-chip">
+                            ~
+                            {activeResult.structured.stats.token_estimate.toLocaleString()}{" "}
+                            tokens
+                          </span>
+                          <span className="json-chip">
+                            {activeResult.structured.stats.section_count}{" "}
+                            sections
+                          </span>
+                          <span className="json-chip">
+                            {activeResult.structured.meta.content_type}
+                          </span>
+                          {activeResult.structured.meta.language !== "en" && (
+                            <span className="json-chip">
+                              {activeResult.structured.meta.language}
+                            </span>
+                          )}
+                        </span>
+                        <span className="json-banner-hint">
+                          Paste this JSON directly into any AI chat to add
+                          structured page context
+                        </span>
+                      </div>
+                      <pre
+                        className="json-body"
+                        dangerouslySetInnerHTML={{
+                          __html: syntaxHighlightJson(
+                            activeResult.structured,
+                            jsonMinified,
+                          ),
+                        }}
+                      />
+                    </>
+                  ) : viewMode === "toon" ? (
+                    (() => {
+                      const toon = toToonFormat(activeResult);
+                      const toonTokens = Math.ceil(toon.length / 4);
+                      const jsonTokens =
+                        activeResult.structured.stats.token_estimate;
+                      const saving = Math.round(
+                        (1 - toonTokens / jsonTokens) * 100,
+                      );
+                      return (
+                        <>
+                          <div className="json-banner">
+                            <span className="json-banner-label">TOON</span>
+                            <span className="json-banner-chips">
+                              <span className="json-chip">
+                                ~{toonTokens.toLocaleString()} tokens
+                              </span>
+                              {saving > 0 && (
+                                <span className="json-chip toon-saving">
+                                  {saving}% smaller than JSON
+                                </span>
+                              )}
+                              <span className="json-chip">
+                                {activeResult.structured.meta.content_type}
+                              </span>
+                            </span>
+                            <span className="json-banner-hint">
+                              Text-Only Optimized Notation — structured but
+                              compact, ideal for token-limited AI chats
+                            </span>
+                          </div>
+                          <pre className="toon-body">{toon}</pre>
+                        </>
+                      );
+                    })()
+                  ) : (
+                    <pre className="plain-body">{displayText}</pre>
+                  )}
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
+
+        {status === "idle" && !hasBatchResults && (
           <div className="idle-hints">
             <div className="hint">
               <span className="hint-icon">01</span>
@@ -1211,15 +1545,21 @@ export default function Home() {
             <div className="hint">
               <span className="hint-icon">03</span>
               <span>
-                Copy or download as Markdown, plain text, or structured JSON
+                Copy or download as Markdown, plain text, JSON, or TOON
               </span>
             </div>
             <div className="hint">
               <span className="hint-icon">04</span>
               <span>
-                JSON view generates an AI-ready schema with metadata, sections,
-                token estimate, and compressed content — paste it straight into
-                any chat
+                TOON (Text-Only Optimized Notation) gives you ~50% fewer tokens
+                than JSON — ideal for context-limited AI chats
+              </span>
+            </div>
+            <div className="hint">
+              <span className="hint-icon">05</span>
+              <span>
+                Batch mode extracts up to 10 URLs at once — switch with the
+                button above the input
               </span>
             </div>
           </div>
@@ -1258,25 +1598,25 @@ const styles = `
   }
 
   /* ── Header ── */
-  .header { margin-bottom: 48px; }
+  .header { margin-bottom: 40px; }
   .header-top {
     display: flex; align-items: center;
-    justify-content: space-between; margin-bottom: 10px;
+    justify-content: space-between; margin-bottom: 10px; gap: 12px;
   }
   .logo {
     font-family: 'IBM Plex Mono', monospace;
-    font-size: clamp(28px, 5vw, 42px);
+    font-size: clamp(22px, 5vw, 42px);
     font-weight: 600; letter-spacing: -0.02em;
   }
   .logo-bracket { color: var(--accent); }
   .logo-text { color: var(--text); }
   .tagline {
     font-family: 'IBM Plex Mono', monospace;
-    font-size: 13px; color: var(--text-muted); letter-spacing: 0.03em;
+    font-size: clamp(11px, 2vw, 13px); color: var(--text-muted); letter-spacing: 0.03em;
   }
 
   /* ── Theme Dropdown ── */
-  .theme-select { position: relative; }
+  .theme-select { position: relative; flex-shrink: 0; }
   .theme-select-btn {
     display: flex; align-items: center; gap: 7px;
     background: var(--surface); border: 1px solid var(--border-bright);
@@ -1298,6 +1638,7 @@ const styles = `
     border-radius: 6px; min-width: 178px; overflow: hidden;
     box-shadow: 0 10px 28px rgba(0,0,0,0.35);
     animation: fade-up 0.12s ease;
+    max-height: 70vh; overflow-y: auto;
   }
   .theme-group-label {
     font-family: 'IBM Plex Mono', monospace; font-size: 10px;
@@ -1317,14 +1658,34 @@ const styles = `
   .theme-option-name { flex: 1; }
   .theme-check { color: var(--accent); font-size: 11px; }
 
+  /* ── Batch toggle row ── */
+  .batch-toggle-row {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+  }
+  .batch-toggle-btn {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    background: transparent; border: 1px solid var(--border-bright);
+    color: var(--text-muted); border-radius: 3px; padding: 5px 12px;
+    cursor: pointer; transition: border-color 0.15s, color 0.15s;
+  }
+  .batch-toggle-btn:hover, .batch-toggle-btn.active {
+    border-color: var(--accent); color: var(--accent);
+  }
+  .batch-toggle-btn.active { background: var(--accent-dim); }
+  .batch-hint {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    color: var(--text-dim);
+  }
+
   /* ── Input ── */
   .input-section { margin-bottom: 32px; }
   .input-wrapper {
-    display: flex; align-items: center;
+    display: flex; align-items: stretch;
     background: var(--surface); border: 1px solid var(--border-bright);
     border-radius: 4px; overflow: hidden;
     transition: border-color 0.2s, box-shadow 0.2s;
   }
+  .input-wrapper.batch { align-items: flex-start; }
   .input-wrapper:focus-within {
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent-dim), 0 0 20px var(--accent-dim);
@@ -1340,17 +1701,25 @@ const styles = `
   .url-input {
     flex: 1; background: transparent; border: none; outline: none;
     color: var(--text); font-family: 'IBM Plex Mono', monospace;
-    font-size: 14px; padding: 16px 16px; min-width: 0;
+    font-size: 14px; padding: 16px; min-width: 0;
     caret-color: var(--accent);
   }
   .url-input::placeholder { color: var(--text-dim); }
   .url-input:disabled { opacity: 0.5; }
+  .url-textarea {
+    flex: 1; background: transparent; border: none; outline: none; resize: none;
+    color: var(--text); font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px; line-height: 1.7; padding: 14px 16px; min-width: 0;
+    caret-color: var(--accent);
+  }
+  .url-textarea::placeholder { color: var(--text-dim); }
+  .url-textarea:disabled { opacity: 0.5; }
   .scrape-btn {
     font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 500;
     background: var(--accent); color: var(--accent-fg);
-    border: none; padding: 16px 24px; cursor: pointer; white-space: nowrap;
+    border: none; padding: 16px 20px; cursor: pointer; white-space: nowrap;
     transition: opacity 0.15s; display: flex; align-items: center; gap: 6px;
-    min-width: 110px; justify-content: center;
+    min-width: 100px; justify-content: center; align-self: stretch;
   }
   .scrape-btn:hover:not(:disabled) { opacity: 0.88; }
   .scrape-btn:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -1378,9 +1747,7 @@ const styles = `
   }
   .rate-dot.rate-dot-warn { background: var(--error); }
   .rate-fraction { letter-spacing: 0.02em; }
-  .rate-pips {
-    display: flex; align-items: center; gap: 3px;
-  }
+  .rate-pips { display: flex; align-items: center; gap: 3px; }
   .rate-pip {
     width: 8px; height: 8px; border-radius: 2px;
     background: var(--border-bright); flex-shrink: 0;
@@ -1395,7 +1762,7 @@ const styles = `
   .error-card {
     display: flex; align-items: flex-start; gap: 12px;
     background: var(--error-bg); border: 1px solid rgba(220,38,38,0.2);
-    border-radius: 4px; padding: 16px 20px;
+    border-radius: 4px; padding: 16px 20px; margin-bottom: 8px;
     font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--error);
   }
   .error-icon { font-size: 14px; flex-shrink: 0; margin-top: 2px; }
@@ -1409,9 +1776,40 @@ const styles = `
     color: var(--error); opacity: 0.75;
     padding-left: 12px; position: relative;
   }
-  .error-reasons li::before {
-    content: '–'; position: absolute; left: 0; opacity: 0.6;
+  .error-reasons li::before { content: '–'; position: absolute; left: 0; opacity: 0.6; }
+
+  /* ── Batch tabs ── */
+  .batch-tabs {
+    display: flex; gap: 4px; margin-bottom: 12px;
+    overflow-x: auto; padding-bottom: 4px;
+    scrollbar-width: thin; scrollbar-color: var(--border-bright) transparent;
   }
+  .batch-tabs::-webkit-scrollbar { height: 4px; }
+  .batch-tabs::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
+  .batch-tab {
+    display: flex; align-items: center; gap: 5px; flex-shrink: 0;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    background: var(--surface); border: 1px solid var(--border-bright);
+    color: var(--text-muted); border-radius: 3px; padding: 5px 12px;
+    cursor: pointer; transition: border-color 0.15s, color 0.15s;
+  }
+  .batch-tab:hover, .batch-tab.active { border-color: var(--accent); color: var(--text); }
+  .batch-tab.active { background: var(--accent-dim); color: var(--accent); }
+  .batch-tab.batch-tab-done .batch-tab-indicator { color: var(--accent); }
+  .batch-tab.batch-tab-error { border-color: rgba(220,38,38,0.3); }
+  .batch-tab.batch-tab-error .batch-tab-indicator { color: var(--error); }
+  .batch-spinner {
+    display: inline-block; width: 10px; height: 10px;
+    border: 1.5px solid rgba(128,128,128,0.2);
+    border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.7s linear infinite;
+  }
+  .batch-item-loading {
+    display: flex; align-items: center; gap: 10px;
+    padding: 32px; color: var(--text-muted);
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+  }
+  .batch-item-loading .spinner { border-top-color: var(--accent); }
 
   /* ── Result ── */
   .result-section { animation: fade-up 0.3s ease; }
@@ -1420,28 +1818,43 @@ const styles = `
     to   { opacity: 1; transform: translateY(0); }
   }
   .result-header {
-    display: flex; align-items: center; justify-content: space-between;
-    flex-wrap: wrap; gap: 12px; padding: 12px 0; margin-bottom: 8px;
+    display: flex; align-items: flex-start; justify-content: space-between;
+    flex-wrap: wrap; gap: 10px; padding: 12px 0; margin-bottom: 8px;
     border-bottom: 1px solid var(--border);
   }
-  .result-meta { display: flex; align-items: center; gap: 8px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; min-width: 0; }
-  .meta-title { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px; }
+  .result-meta {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px; min-width: 0;
+  }
+  .meta-title {
+    color: var(--text); font-weight: 500; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+    max-width: min(260px, 50vw);
+  }
   .meta-divider { color: var(--text-dim); }
   .meta-stat { color: var(--text-muted); white-space: nowrap; }
-  .result-controls { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-  .view-toggle { display: flex; border: 1px solid var(--border-bright); border-radius: 3px; overflow: hidden; }
+  .result-controls {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    flex-shrink: 0;
+  }
+  .view-toggle {
+    display: flex; border: 1px solid var(--border-bright);
+    border-radius: 3px; overflow: hidden;
+  }
   .toggle-btn {
     font-family: 'IBM Plex Mono', monospace; font-size: 11px;
     background: transparent; border: none; color: var(--text-muted);
-    padding: 6px 12px; cursor: pointer; transition: background 0.15s, color 0.15s;
+    padding: 6px 10px; cursor: pointer; transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
   }
   .toggle-btn.active { background: var(--border-bright); color: var(--text); }
   .toggle-btn:hover:not(.active) { color: var(--text); }
   .action-btn {
     font-family: 'IBM Plex Mono', monospace; font-size: 11px;
     background: transparent; border: 1px solid var(--border-bright);
-    color: var(--text-muted); border-radius: 3px; padding: 6px 14px;
+    color: var(--text-muted); border-radius: 3px; padding: 6px 12px;
     cursor: pointer; transition: border-color 0.15s, color 0.15s;
+    white-space: nowrap;
   }
   .action-btn:hover { border-color: var(--accent); color: var(--accent); }
   .action-btn.active-dim {
@@ -1451,7 +1864,7 @@ const styles = `
 
   /* ── Output Area ── */
   .output-area {
-    width: 100%; min-height: 480px; max-height: 72vh;
+    width: 100%; min-height: 400px; max-height: 72vh;
     overflow-y: auto; background: var(--surface);
     border: 1px solid var(--border); border-radius: 4px;
     padding: 28px 32px;
@@ -1468,28 +1881,33 @@ const styles = `
     outline: none; width: 100%; margin: 0; padding: 0;
   }
 
+  /* ── TOON Body ── */
+  .toon-body {
+    font-family: 'IBM Plex Mono', monospace; font-size: 12.5px;
+    line-height: 1.75; color: var(--text); white-space: pre-wrap;
+    word-break: break-word; background: transparent; border: none;
+    outline: none; width: 100%; margin: 0; padding: 0;
+  }
+  .toon-saving { color: var(--accent) !important; border-color: var(--accent) !important; }
+
   /* ── Markdown Body ── */
   .md-body {
     font-family: 'DM Sans', sans-serif; font-size: 15px;
     line-height: 1.75; color: var(--text);
   }
   .md-body > * + * { margin-top: 1em; }
-
-  .md-body h1 { font-size: 1.75em; font-weight: 700; line-height: 1.25; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 0.3em; margin-top: 0; }
-  .md-body h2 { font-size: 1.4em; font-weight: 600; line-height: 1.3; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
-  .md-body h3 { font-size: 1.18em; font-weight: 600; color: var(--text); }
+  .md-body h1 { font-size: 1.65em; font-weight: 700; line-height: 1.25; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 0.3em; margin-top: 0; }
+  .md-body h2 { font-size: 1.35em; font-weight: 600; line-height: 1.3; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+  .md-body h3 { font-size: 1.15em; font-weight: 600; color: var(--text); }
   .md-body h4 { font-size: 1.05em; font-weight: 600; color: var(--text-muted); }
   .md-body h5, .md-body h6 { font-size: 0.95em; font-weight: 600; color: var(--text-muted); }
-
   .md-body p { margin: 0; }
   .md-body strong { font-weight: 700; color: var(--text); }
   .md-body em { font-style: italic; }
-
   .md-body code {
     font-family: 'IBM Plex Mono', monospace; font-size: 0.84em;
     background: var(--code-bg); border: 1px solid var(--border);
-    border-radius: 3px; padding: 0.15em 0.4em; color: var(--accent);
-    word-break: break-all;
+    border-radius: 3px; padding: 0.15em 0.4em; color: var(--accent); word-break: break-all;
   }
   .md-body pre {
     background: var(--code-bg); border: 1px solid var(--border);
@@ -1499,37 +1917,38 @@ const styles = `
     background: transparent; border: none; padding: 0;
     font-size: 0.85em; color: var(--text); word-break: normal;
   }
-
   .md-body blockquote {
     border-left: 3px solid var(--blockquote-border);
-    padding: 4px 0 4px 16px; margin: 0;
-    color: var(--text-muted); font-style: italic;
+    padding: 4px 0 4px 16px; margin: 0; color: var(--text-muted); font-style: italic;
   }
   .md-body blockquote > * + * { margin-top: 0.5em; }
-
   .md-body ul, .md-body ol { padding-left: 1.6em; }
   .md-body ul { list-style: disc; }
   .md-body ol { list-style: decimal; }
   .md-body li { margin-top: 0.3em; }
   .md-body li > ul, .md-body li > ol { margin-top: 0.25em; }
-
   .md-body hr { border: none; border-top: 1px solid var(--border); }
-
-  .md-body table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  .md-body table { width: 100%; border-collapse: collapse; font-size: 0.9em; overflow-x: auto; display: block; }
   .md-body th { background: var(--border); font-weight: 600; text-align: left; }
   .md-body th, .md-body td { border: 1px solid var(--border-bright); padding: 8px 12px; }
   .md-body tr:nth-child(even) td { background: var(--accent-dim); }
-
   .md-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
   .md-body a:hover { opacity: 0.8; }
 
   /* ── Idle Hints ── */
   .idle-hints { display: flex; flex-direction: column; gap: 0; margin-top: 16px; }
-  .hint { display: flex; align-items: flex-start; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--border); font-size: 14px; color: var(--text-muted); }
+  .hint {
+    display: flex; align-items: flex-start; gap: 20px;
+    padding: 16px 0; border-bottom: 1px solid var(--border);
+    font-size: 14px; color: var(--text-muted);
+  }
   .hint:first-child { border-top: 1px solid var(--border); }
-  .hint-icon { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: var(--accent); flex-shrink: 0; margin-top: 1px; letter-spacing: 0.05em; }
+  .hint-icon {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600;
+    color: var(--accent); flex-shrink: 0; margin-top: 1px; letter-spacing: 0.05em;
+  }
 
-  /* ── JSON Banner ── */
+  /* ── JSON / TOON Banner ── */
   .json-banner {
     display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
     padding: 10px 14px; margin-bottom: 16px;
@@ -1564,12 +1983,41 @@ const styles = `
   .json-bool   { color: var(--accent); opacity: 0.8; font-style: italic; }
   .json-null   { color: var(--text-dim); font-style: italic; }
 
-  /* ── Responsive ── */
-  @media (max-width: 600px) {
-    .page { padding: 40px 16px 80px; }
-    .result-header { flex-direction: column; align-items: flex-start; }
-    .scrape-btn { padding: 16px 16px; min-width: 90px; }
-    .meta-title { max-width: 200px; }
-    .output-area { padding: 20px 16px; }
+  /* ── Mobile responsive ── */
+  @media (max-width: 640px) {
+    .page { padding: 28px 14px 72px; }
+    .header { margin-bottom: 28px; }
+    .header-top { gap: 8px; }
+    .theme-select-name { display: none; }
+    .tagline { font-size: 11px; }
+
+    .input-section { margin-bottom: 24px; }
+    .url-input, .url-textarea { font-size: 13px; padding: 13px 12px; }
+    .scrape-btn { font-size: 12px; padding: 13px 14px; min-width: 80px; }
+
+    .result-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+    .result-meta { font-size: 11px; gap: 4px; }
+    .meta-title { max-width: 100%; white-space: normal; }
+    .result-controls { width: 100%; gap: 5px; flex-wrap: wrap; }
+    .view-toggle { flex-shrink: 0; }
+    .toggle-btn { padding: 5px 8px; font-size: 10px; }
+    .action-btn { padding: 5px 10px; font-size: 10px; }
+
+    .output-area { padding: 16px 14px; min-height: 320px; max-height: 60vh; }
+    .md-body { font-size: 14px; }
+    .json-body, .plain-body, .toon-body { font-size: 11.5px; }
+
+    .batch-tabs { gap: 3px; }
+    .batch-tab { font-size: 10px; padding: 4px 10px; }
+
+    .json-banner { padding: 8px 10px; gap: 6px; }
+    .json-chip { font-size: 9px; padding: 1px 6px; }
+
+    .idle-hints { margin-top: 12px; }
+    .hint { padding: 14px 0; font-size: 13px; gap: 14px; }
+    .hint-icon { font-size: 10px; }
+
+    .rate-pips { display: none; }
+    .rate-info { font-size: 10px; }
   }
 `;
