@@ -156,16 +156,43 @@ function detectContentType(sampleHtml: string, title: string): string {
   return "article";
 }
 
+function isCopyrightBoilerplateLine(line: string): boolean {
+  const normalized = line.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+
+  const lower = normalized.toLowerCase();
+  return normalized.length <= 160 && (
+    /(?:^|\s)(?:©|\(c\)|copyright)(?:\s+\d{4}(?:\s*[-–]\s*\d{4})?)?/i.test(normalized) ||
+    lower.includes("all rights reserved")
+  );
+}
+
+function stripBoilerplateLines(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !isCopyrightBoilerplateLine(line))
+    .join("\n");
+}
+
+function sanitizeTextValue(value: string): string {
+  return stripBoilerplateLines(value)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // ─── Markdown output sanitization ────────────────────────────────────────────
 function sanitizeMarkdown(md: string): string {
-  return md
+  return stripBoilerplateLines(md)
     // Remove javascript: / data: / vbscript: link targets
     .replace(/\[([^\]]*)\]\(\s*(javascript|data|vbscript):[^)]*\)/gi, "$1")
     // Strip raw script / iframe blocks Turndown may have passed through
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
     // Remove inline event handlers
-    .replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*')/gi, "");
+    .replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*')/gi, "")
+    // Collapse any runs of blank lines left behind
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 export async function POST(req: NextRequest) {
@@ -285,29 +312,33 @@ export async function POST(req: NextRequest) {
 
     // ── Extract metadata ──────────────────────────────────────────────────────
     // Prefer OpenGraph titles for accuracy, fall back to <title>
-    const title =
+    const title = sanitizeTextValue(
       root.querySelector("meta[property='og:title']")?.getAttribute("content")?.trim() ||
       root.querySelector("title")?.text?.trim() ||
-      "";
+      ""
+    );
 
-    const description =
+    const description = sanitizeTextValue(
       root.querySelector("meta[property='og:description']")?.getAttribute("content")?.trim() ||
       root.querySelector("meta[name='description']")?.getAttribute("content")?.trim() ||
-      "";
+      ""
+    );
 
-    const siteName =
+    const siteName = sanitizeTextValue(
       root.querySelector("meta[property='og:site_name']")?.getAttribute("content")?.trim() ||
-      "";
+      ""
+    );
 
     const canonicalUrl =
       root.querySelector("link[rel='canonical']")?.getAttribute("href")?.trim() ||
       safeUrl;
 
-    const author =
+    const author = sanitizeTextValue(
       root.querySelector("meta[name='author']")?.getAttribute("content")?.trim() ||
       root.querySelector("meta[property='article:author']")?.getAttribute("content")?.trim() ||
       root.querySelector("[itemprop='author'] [itemprop='name']")?.text?.trim() ||
-      "";
+      ""
+    );
 
     const published =
       root.querySelector("meta[property='article:published_time']")?.getAttribute("content")?.trim() ||
@@ -324,9 +355,10 @@ export async function POST(req: NextRequest) {
       root.querySelector("html")?.getAttribute("lang")?.split("-")[0].toLowerCase() ||
       "en";
 
-    const keywordsRaw =
+    const keywordsRaw = sanitizeTextValue(
       root.querySelector("meta[name='keywords']")?.getAttribute("content")?.trim() ||
-      "";
+      ""
+    );
     const keywords = keywordsRaw
       ? keywordsRaw.split(",").map((k) => k.trim()).filter(Boolean).slice(0, 20)
       : [];
@@ -369,7 +401,7 @@ export async function POST(req: NextRequest) {
       replacement: (content) => (content.trim() ? content.trim() : ""),
     });
 
-    let markdown = td.turndown(contentHtml)
+      const markdown = td.turndown(contentHtml)
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]+$/gm, "")
       .trim();
